@@ -1,80 +1,57 @@
 # A joint framework for SPX, VIX and VXX
 
-This repository contains the Python implementation of a model which uses path signatures for the joint pricing and calibration of SPX, VIX and VXX options.
-
-The model uses signatures of time-augmented Ornstein–Uhlenbeck factors to describe volatility dynamics within a common framework. The implementation includes Monte Carlo simulation, joint calibration to market option prices, and evaluation on independently simulated paths.
+Python implementation of a model which uses path signatures for the joint pricing and calibration of SPX, VIX and VXX options.
 
 ## Requirements
 
-The code requires Python 3 and the following packages:
-
-- NumPy
-- SciPy
-- Matplotlib
-- iisignature
-- tqdm
-
-Install the dependencies using:
+Python 3 and the dependencies listed in requirements.txt. Install them with:
 
 ```bash
-python -m pip install numpy scipy matplotlib iisignature tqdm
+python -m pip install -r requirements.txt
 ```
 
 ## Repository contents
 
-functions_highL_fee_roll6d_fit_pubblicazione.py
-Shared functions for simulation, signature calculations, pricing, calibration and diagnostics.
+- functions_level3_enrichment.py: shared simulation, signature, pricing and calibration functions.
+- main_level3_enrichment.py: model configuration and joint calibration.
+- validation_level3_enrichment.py: evaluation on independent Monte Carlo paths and implied-volatility plots.
+- market_data_template.py: empty template for local market inputs.
 
-main_restart_highL_fee_roll6d_fit_pubblicazione.py
-Model configuration, market quotes and joint calibration.
+Keep the scripts in the same directory and retain these filenames so their imports resolve correctly.
 
-out_of_sample_highL_fee_roll6d_fit_pubblicazione.py
-Pricing and diagnostics using fixed parameters and independently simulated paths.
+## Local market data
 
-Keep these three files in the same directory.
+Market quotes are supplied through a local file named market_data_private.py. This file is excluded from version control by .gitignore.
 
+To use your own data:
 
-## Market data
+1. Copy market_data_template.py to market_data_private.py in the same directory as the scripts.
+2. Fill in the spot prices, interest rate, strikes, and call and put bid-ask arrays for each asset. All quote arrays for an asset must match its strike array in length and order.
+3. Keep market_data_private.py on your computer. When uploading through a browser, select only the public repository files.
+4. Update the valuation date, option maturities and futures expiries in both scripts to match your market snapshot.
 
-The example market data are defined directly in the calibration and evaluation scripts as NumPy arrays. They include strikes and bid–ask quotes for SPX, VIX and VXX options, together with spot prices, maturities and the interest rate.
+The imports in the scripts show which variable names are required. Model forwards and implied volatilities are computed from the local inputs. The empty template must be completed before either script can run.
 
-To analyse another market snapshot, update the corresponding inputs in both scripts. Keep valuation dates, option maturities, futures expiries and rolling conventions consistent.
+## Calibration
 
-## Running the calibration
-
-Before running the calibration, review the configuration in the main script, including:
-
-- Factor parameters and correlations.
-- Signature coordinates used by the model.
-- Market quotes and maturities.
-- Number of Monte Carlo paths and time steps.
-- Calibration weights and optimizer settings.
-- Variance constraints, futures floor and VXX fee.
-
-From the directory containing the scripts, run:
+Review the model parameters, signature basis, Monte Carlo settings, calibration weights and constraints in the main script. From the scripts directory, run:
 
 ```bash
-python main_restart_highL_fee_roll6d_fit_pubblicazione.py
+python main_level3_enrichment.py
 ```
 
-The script prints the calibrated signature coefficients and correlation parameters, reports calibration diagnostics, plots the fitted smiles, and saves the calibration results to a NumPy archive.
+The calibrated coefficients and correlations are printed as ell_optimal and rho_b_optimal.
 
-## Evaluating the calibrated model
+## Out-of-sample evaluation
 
-To evaluate a new calibration, copy the resulting `ell_optimal` and `rho_b_optimal` into `ell_fixed` and `rho_b_fixed` in the evaluation script.
-
-Ensure that the signature basis, model parameters, market data and numerical conventions match those used for calibration.
-
-Then run:
+Copy the calibration results into ell_fixed and rho_b_fixed in the out-of-sample script. Match the model settings, market inputs, maturities and numerical conventions to the calibration configuration, then run:
 
 ```bash
-python out_of_sample_highL_fee_roll6d_fit_pubblicazione.py
+python validation_level3_enrichment.py
 ```
 
-The script evaluates option prices on newly simulated paths and reports Monte Carlo uncertainty and model diagnostics. Here, out-of-sample evaluation refers to an independent simulation sample.
+The script computes prices on independent Monte Carlo paths and displays the implied-volatility plots. Control variates are enabled by use_price_control_variates. The sample size and memory usage can be adjusted through total_paths and batch_size.
 
-Adjust `total_paths` and `batch_size` to control the simulation size and memory usage. Use `show_plots` and `save_results` to control plotting and result saving.
+## Reproducibility
 
-## Numerical reproducibility
-
-The supplied configuration does not fix a random seed, so numerical results vary between runs. The number of simulated paths and the time discretization affect Monte Carlo accuracy and computational cost.
+The supplied configuration uses simulation_seed = None, so Monte Carlo samples and numerical results vary between runs.
