@@ -7,7 +7,7 @@ Python implementations for the joint pricing and calibration of SPX, VIX and VXX
 - [OU3D enriched](OU3D_enriched/): three Ornstein-Uhlenbeck factors with a level-three signature enrichment.
 - [OU-CIR](CIR/): two Ornstein-Uhlenbeck factors and one CIR factor with a generator-closed level-three signature enrichment.
 
-Each model has its own shared functions, calibration script, out-of-sample script, empty market-input template and detailed README. Keep each model's files together in its folder.
+Each model has its own shared functions, calibration script, validation script, empty market-input template and detailed README. Keep each model's files together in its folder.
 
 ## Files
 
@@ -89,13 +89,3 @@ See the [CIR instructions](CIR/README.md) for the configuration, constrained cal
 Both implementations use the absolute linear signature proxy for VIX option payoffs. VIX futures use the signed conditional linear signature proxy and are frozen at the floor after their first grid hit. Each contract's stopping history starts at valuation time and is shared across roll intervals, including before activation in VXX.
 
 Both models set future_floor = 1e-2 in calibration and validation: the stopping level is 1 VIX index point. Required futures start strictly above the floor. Keep the same floor in both scripts when changing it.
-
-The CIR implementation has been aligned to this stopping convention. Its supplied manual validation coefficients have not been recalibrated after this change; run calibration and update ell_fixed and rho_b_fixed before evaluating a new fit.
-
-The models retain their respective loss weights, factor dynamics and optimizer settings. OU3D validation enables price control variates, while CIR validation uses the supplied payoffs without control variates or forward rescaling.
-
-## Reproducibility
-
-The supplied scripts draw fresh Monte Carlo paths with simulation_seed = None. Numerical results vary between runs. After calibrating, update the validation coefficients manually. The coefficient arrays already present in the validation scripts are not a new calibration to the reader's inputs.
-
-Validation uses independent paths at the selected market snapshot. Testing another market date requires the corresponding market inputs and a deliberate choice of calibration and evaluation dates.
