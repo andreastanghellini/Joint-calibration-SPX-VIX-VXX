@@ -86,7 +86,13 @@ See the [CIR instructions](CIR/README.md) for the configuration, constrained cal
 
 ## Numerical conventions
 
-The implementations retain their respective pricing and calibration settings. In particular, the OU3D version stops and freezes a VIX futures path at its first floor hit; the CIR version applies its floor pointwise. OU3D validation enables price control variates, while CIR validation uses the supplied payoffs without control variates or forward rescaling.
+Both implementations use the absolute linear signature proxy for VIX option payoffs. VIX futures use the signed conditional linear signature proxy and are frozen at the floor after their first grid hit. Each contract's stopping history starts at valuation time and is shared across roll intervals, including before activation in VXX.
+
+Both models set future_floor = 1e-2 in calibration and validation: the stopping level is 1 VIX index point. Required futures start strictly above the floor. Keep the same floor in both scripts when changing it.
+
+The CIR implementation has been aligned to this stopping convention. Its supplied manual validation coefficients have not been recalibrated after this change; run calibration and update ell_fixed and rho_b_fixed before evaluating a new fit.
+
+The models retain their respective loss weights, factor dynamics and optimizer settings. OU3D validation enables price control variates, while CIR validation uses the supplied payoffs without control variates or forward rescaling.
 
 ## Reproducibility
 

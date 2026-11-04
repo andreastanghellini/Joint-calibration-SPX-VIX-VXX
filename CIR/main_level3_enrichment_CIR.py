@@ -38,7 +38,8 @@ rho_primary[:2, :2] = rho_ou
 market_maturities = np.array([T_spx, T_vix, T_vxx])
 previous_expiry = (previous_vix_future_expiry - valuation_date).days / 365.0
 leverage_cap = 100.0
-future_floor = 1e-8
+future_floor = 1e-2
+future_initial_safety_margin = 1e-8
 vxx_annual_fee = 0.0089
 variance_treatment = "positive_part"
 variance_softness = 1e-8
@@ -119,6 +120,13 @@ vix_future_propagator = functions.precompute_vix_future_propagators(np.array([0.
 vxx_roll_data = functions.precompute_vxx_roll_data(time_steps_vxx, futures_maturities, G_n, previous_expiry=previous_expiry)
 
 
+# === INITIAL FUTURES CONSTRAINTS ===
+required_future_maturities = np.unique(np.array([T_vix] + [maturity for segment in vxx_roll_data for maturity in segment[2:4]]))
+initial_future_loadings = np.stack([functions.precompute_vix_future_propagators(np.array([0.0]), maturity, G_n)[0]
+    @ sigX_truncated[0, 0] for maturity in required_future_maturities])
+minimum_initial_future = future_floor + future_initial_safety_margin
+
+
 # === OBJECTIVE INPUTS AND VARIANCE CONSTRAINT ===
 objective_model_inputs = {
     "shuffle_tensor_nn": None, "variance_signature_features": variance_signature_features,
@@ -190,7 +198,8 @@ scaled_objective = partial(functions.normalized_cir_objective, objective_with_co
 # === CONSTRAINED JOINT CALIBRATION ===
 calibration_result = functions.calibrate_cubic_with_active_constraints(scaled_objective, calibration_parameters0, dimension_ell,
     variance_signature_features[:N_variance_constraint], sigX_truncated[:N_variance_constraint], variance_pair_positions,
-    variance_shuffle_coordinates, window, minimum_variance=minimum_variance + variance_safety_margin, **optimizer_options)
+    variance_shuffle_coordinates, window, minimum_variance=minimum_variance + variance_safety_margin,
+    initial_future_loadings=initial_future_loadings, minimum_initial_future=minimum_initial_future, **optimizer_options)
 calibration_parameters_optimal = np.asarray(calibration_result.x, dtype=float)
 ell_optimal = calibration_parameters_optimal[:dimension_ell]
 rho_b_optimal = functions.rho_b_from_parameters(calibration_parameters_optimal[dimension_ell:], rho_primary)

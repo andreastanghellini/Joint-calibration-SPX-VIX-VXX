@@ -18,6 +18,12 @@ except ImportError:
         return iterable
 
 
+PAPER_PRICING_VERSION = "cir_fit_abs_vix_stopped_futures_v1"
+VIX_PROXY = "absolute_linear_signature"
+VIX_FUTURE_PROXY = "stopped_signed_conditional_signature"
+FUTURE_STOPPING_SCHEME = "first_grid_hit_freeze_at_m"
+
+
 # Encode a signature word in level-first lexicographic order.
 def from_word_to_num(word, d_minus_one):
     if len(word) == 0:
@@ -393,6 +399,12 @@ def vix_path(ell, N, truncated_signature_path):
         raise ValueError('N must be a valid time-grid index.')
     return 100.0 * np.einsum('tpi,i->tp', truncated_signature_path[:N + 1], ell, optimize=True)
 
+# Return the absolute linear VIX proxy in VIX points.
+def vix_option_proxy(raw_vix_points):
+    raw = np.asarray(raw_vix_points, dtype=float)
+    return np.abs(raw)
+
+
 # Precompute conditional-signature propagators for a VIX future.
 def precompute_vix_future_propagators(time_steps, maturity, generator):
     time_steps = np.asarray(time_steps, dtype=float)
@@ -407,7 +419,7 @@ def precompute_vix_future_propagators(time_steps, maturity, generator):
         raise ValueError('time_steps must lie between zero and maturity.')
     return np.stack([expm((maturity - time) * generator) for time in time_steps])
 
-# Prepare the roll intervals and their VIX-future propagators.
+# Prepare the roll intervals and each contract's history from valuation time.
 def precompute_vxx_roll_data(time_steps, futures_maturities, generator, previous_expiry=None):
     time_steps = np.asarray(time_steps, dtype=float)
     futures_maturities = np.asarray(futures_maturities, dtype=float)
@@ -429,6 +441,15 @@ def precompute_vxx_roll_data(time_steps, futures_maturities, generator, previous
         raise ValueError('previous_expiry must precede the first live VIX-future maturity.')
     if time_steps[-1] > futures_maturities[-2] + 1e-12:
         raise ValueError('A second live VIX future is required over the whole time horizon.')
+    histories = {}
+
+    # Cache the complete pre-activation history of one futures contract.
+    def history(maturity):
+        if maturity not in histories:
+            nodes = time_steps[time_steps <= maturity + 1e-12]
+            histories[maturity] = precompute_vix_future_propagators(nodes, maturity, generator)
+        return histories[maturity]
+
     roll_data = []
     horizon = time_steps[-1]
     for maturity_index in range(futures_maturities.size - 1):
@@ -445,10 +466,9 @@ def precompute_vxx_roll_data(time_steps, futures_maturities, generator, previous
         if not np.isclose(time_steps[right_index], segment_end, atol=1e-12, rtol=1e-10):
             raise ValueError('The end of every roll segment must belong to time_steps.')
         time_indices = np.arange(left_index, right_index + 1, dtype=int)
-        segment_times = time_steps[time_indices]
-        front_propagators = precompute_vix_future_propagators(segment_times, front_expiry, generator)
-        second_propagators = precompute_vix_future_propagators(segment_times, second_expiry, generator)
-        roll_data.append((time_indices, segment_previous_expiry, front_expiry, second_expiry, front_propagators, second_propagators))
+        front_history, second_history = history(front_expiry), history(second_expiry)
+        roll_data.append((time_indices, segment_previous_expiry, front_expiry, second_expiry,
+            front_history[time_indices], second_history[time_indices], front_history, second_history))
         if horizon <= front_expiry + 1e-12:
             break
     return tuple(roll_data)
@@ -472,19 +492,43 @@ def vix_future_path(ell, propagators, truncated_signature_path):
     propagated_ell = np.einsum('i,tij->tj', ell, propagators, optimize=True)
     return 100.0 * np.einsum('tj,tpj->tp', propagated_ell, truncated_signature_path, optimize=True)
 
-# Apply the pointwise future floor used by the supplied CIR model.
-def regularize_vix_futures(raw_future_points, future_floor=1e-08):
-    if not np.isfinite(future_floor) or future_floor <= 0.0:
-        raise ValueError('future_floor must be finite and strictly positive in decimal VIX units.')
+# Convert the decimal future stopping level into VIX points.
+def future_floor_in_points(future_floor=1e-8):
     floor_points = 100.0 * float(future_floor)
-    if not np.isfinite(floor_points):
-        raise ValueError('The future floor in VIX points must be finite.')
-    raw = np.asarray(raw_future_points, dtype=float)
-    regularized = np.maximum(raw, floor_points)
-    return np.where(np.isfinite(raw), regularized, raw)
+    if not np.isfinite(floor_points) or floor_points <= 0.0:
+        raise ValueError('future_floor must be finite and strictly positive in decimal VIX units.')
+    return floor_points
 
-# Evaluate discounted VXX over one roll interval.
-def vxx_roll_segment_path(initial_vxx, time_steps, previous_expiry, front_expiry, front_future_path, second_future_path, future_floor=1e-08):
+
+# Stop each future at its first grid hit of 100*m and keep it frozen thereafter.
+def regularize_vix_futures(raw_future_points, future_floor=1e-8, return_diagnostics=False):
+    floor_points = future_floor_in_points(future_floor)
+    raw = np.asarray(raw_future_points, dtype=float)
+    if raw.ndim == 0:
+        return raw.copy()
+    crossed = raw <= floor_points
+    stopped_mask = np.maximum.accumulate(crossed, axis=0)
+    stopped = np.where(stopped_mask, floor_points, raw)
+    if not return_diagnostics:
+        return stopped
+    hit = np.any(crossed, axis=0)
+    first = np.where(hit, np.argmax(crossed, axis=0), -1)
+    first_values = np.take_along_axis(raw, np.maximum(first, 0)[None, ...], axis=0)[0]
+    overshoot = np.where(hit, np.maximum(floor_points - first_values, 0.0), 0.0)
+    return (
+        stopped,
+        {
+            "stopped_mask": stopped_mask,
+            "first_hit_indices": first,
+            "hit_paths": int(np.count_nonzero(hit)),
+            "stopped_values": int(np.count_nonzero(stopped_mask)),
+            "first_hit_overshoot_points": overshoot,
+            "maximum_first_hit_overshoot_points": float(np.max(overshoot))
+        }
+    )
+
+# Evaluate one VXX roll interval from globally stopped futures in VIX points.
+def vxx_roll_segment_path(initial_vxx, time_steps, previous_expiry, front_expiry, front_future_path, second_future_path):
     time_steps = np.asarray(time_steps, dtype=float)
     front_future_path = np.asarray(front_future_path, dtype=float)
     second_future_path = np.asarray(second_future_path, dtype=float)
@@ -506,8 +550,6 @@ def vxx_roll_segment_path(initial_vxx, time_steps, previous_expiry, front_expiry
     invalid_output = np.full((n_times, n_paths), np.nan)
     if not np.all(np.isfinite(front_future_path)) or not np.all(np.isfinite(second_future_path)):
         return invalid_output
-    front_future_path = regularize_vix_futures(front_future_path, future_floor)
-    second_future_path = regularize_vix_futures(second_future_path, future_floor)
     front_weight = front_expiry - time_steps
     second_weight = time_steps - previous_expiry
     roll_basket = front_weight[:, None] * front_future_path + second_weight[:, None] * second_future_path
@@ -527,96 +569,90 @@ def vxx_roll_segment_path(initial_vxx, time_steps, previous_expiry, front_expiry
         return invalid_output
     return vxx_path
 
-# Join the VXX roll intervals with the CIR model future floor.
-def vxx_path(initial_vxx, ell, time_steps, truncated_signature_path, roll_data, future_floor=1e-08, return_diagnostics=False, retain_future_paths=False):
-    if retain_future_paths and (not return_diagnostics):
-        raise ValueError('retain_future_paths requires return_diagnostics=True.')
-    regularize_vix_futures(0.0, future_floor)
-    ell = np.asarray(ell, dtype=float)
-    time_steps = np.asarray(time_steps, dtype=float)
-    truncated_signature_path = np.asarray(truncated_signature_path, dtype=float)
-    if not np.isfinite(initial_vxx) or initial_vxx <= 0.0:
-        raise ValueError('initial_vxx must be finite and strictly positive.')
-    if time_steps.ndim != 1 or time_steps.size == 0:
-        raise ValueError('time_steps must be a non-empty one-dimensional array.')
-    if not np.all(np.isfinite(time_steps)) or np.any(np.diff(time_steps) <= 0.0) or (not np.isclose(time_steps[0], 0.0)):
-        raise ValueError('time_steps must be finite, strictly increasing and start from zero.')
-    if truncated_signature_path.ndim != 3 or truncated_signature_path.shape[0] != time_steps.size:
-        raise ValueError('truncated_signature_path and time_steps have incompatible dimensions.')
-    if ell.ndim != 1 or ell.size != truncated_signature_path.shape[-1]:
-        raise ValueError('ell has incompatible dimensions.')
-    if len(roll_data) == 0:
-        raise ValueError('roll_data must contain at least one roll segment.')
-    n_times, n_paths = truncated_signature_path.shape[:2]
-    invalid_output = np.full((n_times, n_paths), np.nan)
-    output = np.empty((n_times, n_paths), dtype=float)
-    current_vxx = np.full(n_paths, initial_vxx, dtype=float)
-    previous_right_index = None
-    diagnostics = {'future_floor_decimal': float(future_floor), 'future_floor_points': 100.0 * float(future_floor), 'evaluated_future_values': 0, 'floored_future_values': 0, 'negative_raw_future_values': 0, 'raw_future_minimum_points': np.inf, 'regularized_future_minimum_points': np.inf, 'maximum_floor_adjustment_points': 0.0, 'minimum_roll_basket': np.inf, 'floored_future_fraction': 0.0, 'valid_path': False}
-    if retain_future_paths:
-        diagnostics['bound_segments'] = []
-
-    # Return the path and the optional floor statistics.
-    def finish(path, valid):
-        diagnostics['valid_path'] = bool(valid)
-        count = diagnostics['evaluated_future_values']
-        diagnostics['floored_future_fraction'] = diagnostics['floored_future_values'] / count if count else 0.0
-        return (path, diagnostics) if return_diagnostics else path
+# Return one global stopped history per contract, shared across roll dates.
+def stopped_vxx_future_paths(ell, signature_path, roll_data, future_floor=1e-8):
+    signature_path = np.asarray(signature_path, dtype=float)
+    paths = {}
     for segment in roll_data:
-        if len(segment) != 6:
-            raise ValueError('Every roll segment must contain six precomputed objects.')
-        time_indices, previous_expiry, front_expiry, second_expiry, front_propagators, second_propagators = segment
-        time_indices = np.asarray(time_indices, dtype=int)
-        front_propagators = np.asarray(front_propagators, dtype=float)
-        second_propagators = np.asarray(second_propagators, dtype=float)
-        if time_indices.ndim != 1 or time_indices.size == 0 or np.any(np.diff(time_indices) != 1):
-            raise ValueError('Each roll segment must contain consecutive time indices.')
-        if time_indices[0] < 0 or time_indices[-1] >= n_times:
-            raise ValueError('roll_data contains indices outside the simulation grid.')
-        if previous_right_index is None:
-            if time_indices[0] != 0:
-                raise ValueError('The first roll segment must start at time index zero.')
-        elif time_indices[0] != previous_right_index:
-            raise ValueError('Consecutive roll segments must share their boundary index.')
-        if not np.isfinite(previous_expiry) or not np.isfinite(front_expiry) or (not np.isfinite(second_expiry)):
-            raise ValueError('Roll expiries must be finite.')
-        if front_expiry <= previous_expiry or second_expiry <= front_expiry:
-            raise ValueError('Roll expiries must be strictly increasing.')
-        segment_signature_path = truncated_signature_path[time_indices]
-        front_future_path = vix_future_path(ell, front_propagators, segment_signature_path)
-        second_future_path = vix_future_path(ell, second_propagators, segment_signature_path)
-        if not np.all(np.isfinite(front_future_path)) or not np.all(np.isfinite(second_future_path)):
-            return finish(invalid_output, False)
-        if retain_future_paths:
-            diagnostics['bound_segments'].append({'times': time_steps[time_indices], 'previous_expiry': float(previous_expiry), 'front_expiry': float(front_expiry), 'second_expiry': float(second_expiry), 'raw_front': front_future_path / 100.0, 'raw_second': second_future_path / 100.0})
-        segment_factor = vxx_roll_segment_path(1.0, time_steps[time_indices], previous_expiry, front_expiry, front_future_path, second_future_path, future_floor=future_floor)
-        if not np.all(np.isfinite(segment_factor)):
-            return finish(invalid_output, False)
+        for maturity, propagators in ((segment[2], segment[6]), (segment[3], segment[7])):
+            if maturity in paths:
+                continue
+            raw = vix_future_path(ell, propagators, signature_path[: len(propagators)])
+            stopped, diagnostics = regularize_vix_futures(raw, future_floor, return_diagnostics=True)
+            paths[maturity] = {"raw": raw, "stopped": stopped, "alive": ~diagnostics["stopped_mask"], **diagnostics}
+    return paths
+
+
+# Build the discounted, fee-free VXX path from globally stopped futures.
+def vxx_path(initial_vxx, ell, time_steps, truncated_signature_path, roll_data, future_floor=1e-8, return_diagnostics=False):
+    floor_points = future_floor_in_points(future_floor)
+    times = np.asarray(time_steps, dtype=float)
+    signatures = np.asarray(truncated_signature_path, dtype=float)
+    ell = np.asarray(ell, dtype=float)
+    n_times, n_paths = signatures.shape[:2]
+    invalid = np.full((n_times, n_paths), np.nan)
+    diagnostics = {
+        "future_floor_decimal": float(future_floor),
+        "future_floor_points": floor_points,
+        "future_stopping_scheme": FUTURE_STOPPING_SCHEME,
+        "evaluated_future_values": 0,
+        "stopped_future_values": 0,
+        "floored_future_values": 0,
+        "negative_raw_future_values": 0,
+        "raw_future_minimum_points": np.inf,
+        "regularized_future_minimum_points": np.inf,
+        "maximum_floor_adjustment_points": 0.0,
+        "maximum_first_hit_overshoot_points": 0.0,
+        "stopped_contract_paths": 0,
+        "evaluated_contract_paths": 0,
+        "minimum_roll_basket": np.inf,
+        "floored_future_fraction": 0.0,
+        "initial_future_admissible": True,
+        "valid_path": False
+    }
+
+    # Return the VXX path with its diagnostics when requested.
+    def finish(path, valid):
+        diagnostics["valid_path"] = bool(valid)
+        if diagnostics["evaluated_future_values"]:
+            diagnostics["floored_future_fraction"] = (diagnostics["stopped_future_values"] / diagnostics["evaluated_future_values"])
+        return (path, diagnostics) if return_diagnostics else path
+
+    future_paths = stopped_vxx_future_paths(ell, signatures, roll_data, future_floor)
+    if any((np.any(item["raw"][0] <= floor_points) for item in future_paths.values())):
+        diagnostics["initial_future_admissible"] = False
+        return finish(invalid, False)
+    for item in future_paths.values() if return_diagnostics else ():
+        raw, stopped = (item["raw"], item["stopped"])
+        diagnostics["evaluated_future_values"] += raw.size
+        diagnostics["stopped_future_values"] += item["stopped_values"]
+        diagnostics["floored_future_values"] += item["stopped_values"]
+        diagnostics["stopped_contract_paths"] += item["hit_paths"]
+        diagnostics["evaluated_contract_paths"] += n_paths
+        diagnostics["negative_raw_future_values"] += int(np.count_nonzero(raw < 0.0))
+        diagnostics["raw_future_minimum_points"] = min(diagnostics["raw_future_minimum_points"], float(raw.min()))
+        diagnostics["regularized_future_minimum_points"] = min(diagnostics["regularized_future_minimum_points"], float(stopped.min()))
+        diagnostics["maximum_floor_adjustment_points"] = max(diagnostics["maximum_floor_adjustment_points"], float(np.max(np.abs(stopped - raw))))
+        diagnostics["maximum_first_hit_overshoot_points"] = max(diagnostics["maximum_first_hit_overshoot_points"], item["maximum_first_hit_overshoot_points"])
+    output = np.empty((n_times, n_paths))
+    current = np.full(n_paths, initial_vxx)
+    last = None
+    for segment in roll_data:
+        indices, previous, front, second, _, _, _, _ = segment
+        f = future_paths[front]["stopped"][indices]
+        g = future_paths[second]["stopped"][indices]
+        factor = vxx_roll_segment_path(1.0, times[indices], previous, front, f, g)
+        if not np.all(np.isfinite(factor)):
+            return finish(invalid, False)
+        values = current[None, :] * factor
+        output[indices if last is None else indices[1:]] = values if last is None else values[1:]
         if return_diagnostics:
-            observations = slice(None) if previous_right_index is None else slice(1, None)
-            floor_points = diagnostics['future_floor_points']
-            for raw_future in (front_future_path[observations], second_future_path[observations]):
-                if not raw_future.size:
-                    continue
-                raw_minimum = float(np.min(raw_future))
-                diagnostics['evaluated_future_values'] += int(raw_future.size)
-                diagnostics['floored_future_values'] += int(np.count_nonzero(raw_future < floor_points))
-                diagnostics['negative_raw_future_values'] += int(np.count_nonzero(raw_future < 0.0))
-                diagnostics['raw_future_minimum_points'] = min(diagnostics['raw_future_minimum_points'], raw_minimum)
-                diagnostics['regularized_future_minimum_points'] = min(diagnostics['regularized_future_minimum_points'], max(raw_minimum, floor_points))
-                diagnostics['maximum_floor_adjustment_points'] = max(diagnostics['maximum_floor_adjustment_points'], max(floor_points - raw_minimum, 0.0))
-            segment_times = time_steps[time_indices]
-            basket = (front_expiry - segment_times)[:, None] * regularize_vix_futures(front_future_path, future_floor) + (segment_times - previous_expiry)[:, None] * regularize_vix_futures(second_future_path, future_floor)
-            diagnostics['minimum_roll_basket'] = min(diagnostics['minimum_roll_basket'], float(np.min(basket)))
-        segment_path = current_vxx[None, :] * segment_factor
-        if previous_right_index is None:
-            output[time_indices] = segment_path
-        else:
-            output[time_indices[1:]] = segment_path[1:]
-        current_vxx = segment_path[-1]
-        previous_right_index = int(time_indices[-1])
-    if previous_right_index != n_times - 1 or not np.all(np.isfinite(output)):
-        return finish(invalid_output, False)
+            basket = (front - times[indices, None]) * f + (times[indices, None] - previous) * g
+            diagnostics["minimum_roll_basket"] = min(diagnostics["minimum_roll_basket"], float(basket.min()))
+        current = values[-1]
+        last = int(indices[-1])
+    if last != n_times - 1 or not np.all(np.isfinite(output)):
+        return finish(invalid, False)
     return finish(output, True)
 
 # Evaluate the optional smooth positive variance transform.
@@ -784,7 +820,7 @@ def joint_calibration_objective(
         raise ValueError('vxx_annual_fee must be a finite nonnegative annual decimal rate.')
     if not np.isfinite(leverage_cap) or leverage_cap <= 0.0:
         raise ValueError('The paper requires a finite, strictly positive leverage_cap.')
-    regularize_vix_futures(0.0, future_floor)
+    future_floor_in_points(future_floor)
     ell = np.asarray(ell, dtype=float)
     truncated_signature_path = np.asarray(truncated_signature_path, dtype=float)
     time_steps_vxx = np.asarray(time_steps_vxx, dtype=float)
@@ -816,10 +852,10 @@ def joint_calibration_objective(
         stock_ratio_spx = stock_ratio_path(effective_variance_spx, brownian_increments[:N_spx], dt)
         terminal_spx = forward_spx * stock_ratio_spx[-1]
         model_prices_spx = monte_carlo_option_prices(terminal_spx, strikes_spx, maturity_spx, rate, cp_spx)
-        terminal_vix = np.abs(vix_path(ell, N_vix, truncated_signature_path)[-1])
+        terminal_vix = vix_option_proxy(vix_path(ell, N_vix, truncated_signature_path)[-1])
         model_prices_vix = monte_carlo_option_prices(terminal_vix, strikes_vix, maturity_vix, rate, cp_vix)
         model_future_vix_raw = 100.0 * ell @ vix_future_propagator @ truncated_signature_path[0, 0]
-        model_future_vix = float(regularize_vix_futures(model_future_vix_raw, future_floor))
+        model_future_vix = float(model_future_vix_raw)
         discounted_vxx_path = vxx_path(vxx_spot, ell, time_steps_vxx, truncated_signature_path[:time_steps_vxx.size], vxx_roll_data, future_floor=future_floor)
         terminal_vxx = np.exp((rate - vxx_annual_fee) * maturity_vxx) * discounted_vxx_path[-1]
         model_prices_vxx = monte_carlo_option_prices(terminal_vxx, strikes_vxx, maturity_vxx, rate, cp_vxx)
@@ -827,6 +863,8 @@ def joint_calibration_objective(
         loss_vix = calibration_block_loss(model_prices_vix, bid_vix, ask_vix, normalization_vix, beta_vix, model_future_vix, market_future_vix, deltas_vix)
         loss_vxx = calibration_block_loss(model_prices_vxx, bid_vxx, ask_vxx, normalization_vxx, beta_vxx)
         joint_loss = lambda_spx * loss_spx + lambda_vix * loss_vix + lambda_vxx * loss_vxx
+    if model_future_vix_raw <= future_floor_in_points(future_floor):
+        joint_loss = 1000000000000.0
     joint_loss = float(joint_loss) if np.isfinite(joint_loss) else 1000000000000.0
     calibration_details = {'SPX': float(loss_spx), 'VIX': float(loss_vix), 'VXX': float(loss_vxx), 'model_prices': {'SPX': model_prices_spx, 'VIX': model_prices_vix, 'VXX': model_prices_vxx}, 'model_future_vix': float(model_future_vix), 'model_future_vix_raw': float(model_future_vix_raw), 'leverage_saturated_fraction': float(np.mean(effective_variance_spx > leverage_cap ** 2)), 'stock_ratio_mean': float(np.mean(stock_ratio_spx[-1]))}
     if return_components:
@@ -1142,7 +1180,7 @@ def sampled_variance_matrices(features, pair_positions, shuffle_coordinates, win
 # Run the supplied SLSQP constraint-exchange calibration.
 def calibrate_cubic_with_active_constraints(
     objective, initial_parameters, dimension_ell, features, signatures, pair_positions, shuffle_coordinates, window, minimum_variance=1e-06, minimum_vix=1e-08,
-    maxiter=240, stage_iterations=40, max_stages=8, ftol=3e-05, progress=True,
+    maxiter=240, stage_iterations=40, max_stages=8, ftol=3e-05, progress=True, initial_future_loadings=None, minimum_initial_future=0.0,
 ):
     from scipy.optimize import minimize, OptimizeResult
     from time import perf_counter
@@ -1153,15 +1191,19 @@ def calibrate_cubic_with_active_constraints(
         raise ValueError('Expected ell and three SPX-correlation parameters.')
     flat_signatures = np.asarray(signatures).reshape(-1, k)
     constraint_tolerance = 1e-10
+    initial_future_loadings = np.empty((0, k)) if initial_future_loadings is None else np.asarray(initial_future_loadings, dtype=float)
 
-    # Check variance and signed VIX on the complete calibration sample.
+    # Check sampled variance, signed VIX and every initial futures value.
     def full_check(parameters):
         ell = parameters[:k]
         product = reduced_shuffle_product_ell(ell, pair_positions, shuffle_coordinates)
         variance = variance_path(product, features.shape[0], features, window).ravel()
         vix = flat_signatures @ ell
-        finite = np.all(np.isfinite(variance)) and np.all(np.isfinite(vix))
-        feasible = finite and np.min(variance) >= minimum_variance - constraint_tolerance and (np.min(vix) >= minimum_vix - constraint_tolerance)
+        initial_futures = initial_future_loadings @ ell
+        finite = np.all(np.isfinite(variance)) and np.all(np.isfinite(vix)) and np.all(np.isfinite(initial_futures))
+        feasible = (finite and np.min(variance) >= minimum_variance - constraint_tolerance
+            and np.min(vix) >= minimum_vix - constraint_tolerance
+            and np.all(initial_futures >= minimum_initial_future - constraint_tolerance))
         return (bool(feasible), variance, vix)
     anchor = initial_parameters.copy()
     anchor[:k] = 0
@@ -1246,17 +1288,18 @@ def calibrate_cubic_with_active_constraints(
             print(progress_header, flush=True)
             print('-' * len(progress_header), flush=True)
 
-        # Evaluate the currently active variance and VIX constraints.
+        # Evaluate active variance and VIX constraints and all initial futures.
         def inequalities(q):
             ell = (q * scale)[:k]
-            return np.r_[np.einsum('i,mij,j->m', ell, h, ell) - minimum_variance, linear @ ell - minimum_vix]
+            return np.r_[np.einsum('i,mij,j->m', ell, h, ell) - minimum_variance, linear @ ell - minimum_vix, initial_future_loadings @ ell - minimum_initial_future]
 
         # Differentiate the active constraints in scaled optimization coordinates.
         def inequality_jacobian(q):
             ell = (q * scale)[:k]
-            jac = np.zeros((len(h) + len(linear), k + 3))
+            jac = np.zeros((len(h) + len(linear) + len(initial_future_loadings), k + 3))
             jac[:len(h), :k] = 2 * np.einsum('mij,j->mi', h, ell)
-            jac[len(h):, :k] = linear
+            jac[len(h):len(h) + len(linear), :k] = linear
+            jac[len(h) + len(linear):, :k] = initial_future_loadings
             return jac * scale[None, :]
         count = [0]
 

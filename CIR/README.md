@@ -33,9 +33,19 @@ Review the model parameters, Monte Carlo settings and optimizer options in the m
 python main_level3_enrichment_CIR.py
 ```
 
-The model retains two OU factors and one CIR factor, the generator-closed time/CIR and slow-OU cubic enrichment, positive-part SPX variance, the absolute VIX option proxy, pointwise floors on the signed conditional VIX futures, and the supplied VXX roll and fee conventions. The constrained solver retains its active-set stages and complete sampled variance and signed-VIX checks.
+The model retains two OU factors and one CIR factor, the generator-closed time/CIR and slow-OU cubic enrichment, positive-part SPX variance, the absolute VIX option proxy, first-hit stopping of the signed conditional VIX futures, and the supplied VXX roll and fee conventions. The constrained solver retains its active-set stages and complete sampled variance and signed-VIX checks, and enforces that every required future starts above its stopping level.
 
 Initial coefficients and loss normalizations are constructed in the main script. Automatic checkpoint loading and result archives have been removed. Calibration features use a separate run folder inside cache_CIR to avoid keeping the full feature tensor in RAM and reusing files still open in another session. The directory is ignored by Git and can be deleted after closing the running Python session.
+
+## VIX proxy and futures stopping
+
+VIX option payoffs use the absolute linear signature proxy: 100 * abs(ell dot signature). The same vix_option_proxy function is used in calibration and validation.
+
+Futures use the signed conditional linear signature proxy. Each contract is stopped at the first simulation-grid value at or below 100 * future_floor and is then frozen at that level. Its history starts at valuation time, including before it enters the VXX roll; changing its role in the roll does not reset its stopping history. No absolute value is applied to futures.
+
+The main and validation scripts both set future_floor = 1e-2, matching OU3D_enriched. This is a decimal VIX level and corresponds to 1 VIX index point. Set the same value in both scripts when changing it. Required futures must start strictly above this level; invalid initial values are rejected instead of being clipped.
+
+Recalibrate before using validation coefficients with the updated stopping convention. The supplied manual coefficients were not recalibrated by this code update.
 
 ## Out-of-sample plots
 

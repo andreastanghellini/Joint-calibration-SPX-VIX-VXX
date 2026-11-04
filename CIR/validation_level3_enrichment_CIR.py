@@ -37,7 +37,7 @@ rho_primary[:2, :2] = rho_ou
 market_maturities = np.array([T_spx, T_vix, T_vxx])
 previous_expiry = (previous_vix_future_expiry - valuation_date).days / 365.0
 leverage_cap = 100.0
-future_floor = 1e-8
+future_floor = 1e-2
 vxx_annual_fee = 0.0089
 variance_treatment = "positive_part"
 variance_softness = 1e-8
@@ -99,7 +99,9 @@ vxx_roll_data = functions.precompute_vxx_roll_data(time_steps_vxx, futures_matur
 vix_future_propagator = functions.precompute_vix_future_propagators(np.array([0.0]), T_vix, G_n)[0]
 initial_signature = np.zeros(dimension_ell)
 initial_signature[0] = 1.0
-model_future_vix = float(functions.regularize_vix_futures(100.0 * ell_fixed @ vix_future_propagator @ initial_signature, future_floor))
+model_future_vix = float(100.0 * ell_fixed @ vix_future_propagator @ initial_signature)
+if not np.isfinite(model_future_vix) or model_future_vix <= functions.future_floor_in_points(future_floor):
+    raise RuntimeError("The initial VIX future must exceed the stopping floor; recalibrate the fixed coefficients.")
 price_sums = {"SPX": np.zeros_like(strikes_spx, dtype=float), "VIX": np.zeros_like(strikes_vix, dtype=float), "VXX": np.zeros_like(strikes_vxx, dtype=float)}
 batches = int(np.ceil(total_paths / batch_size))
 seeds = np.random.SeedSequence(simulation_seed).spawn(batches)
@@ -118,7 +120,7 @@ for batch in range(batches):
     brownian_increments = functions.brownian_increments_with_saturation(rho_b_fixed, rho_primary, variance_left,
         primary_brownian_increments, np.sqrt(dt) * independent_brownian_normals, leverage_cap)
     terminal_spx = forward_spx * functions.stock_ratio_path(variance_left, brownian_increments, dt)[-1]
-    terminal_vix = np.abs(100.0 * (sigX_truncated[N_vix] @ ell_fixed))
+    terminal_vix = functions.vix_option_proxy(100.0 * (sigX_truncated[N_vix] @ ell_fixed))
     discounted_vxx = functions.vxx_path(vxx_spot, ell_fixed, time_steps_vxx, sigX_truncated[:N_vxx + 1], vxx_roll_data, future_floor=future_floor)[-1]
     terminal_vxx = np.exp((r - vxx_annual_fee) * T_vxx) * discounted_vxx
     for name, terminal, strikes, maturity in (("SPX", terminal_spx, strikes_spx, T_spx), ("VIX", terminal_vix, strikes_vix, T_vix), ("VXX", terminal_vxx, strikes_vxx, T_vxx)):
