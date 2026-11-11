@@ -146,7 +146,7 @@ objective_model_inputs = {
     "vix_future_propagator": vix_future_propagator, "vxx_roll_data": vxx_roll_data,
     "forward_spx": forward_spx, "vxx_spot": vxx_spot, "leverage_cap": leverage_cap,
     "future_floor": future_floor, "vxx_annual_fee": vxx_annual_fee,
-    "use_price_control_variates": True, "vix_control_loadings": vix_control_loadings, "collect_gradient_inputs": True,
+    "use_price_control_variates": False, "vix_control_loadings": vix_control_loadings, "collect_gradient_inputs": True,
 }
 objective_market_inputs = {
     "strikes_spx": strikes_spx, "strikes_vix": strikes_vix, "strikes_vxx": strikes_vxx,
