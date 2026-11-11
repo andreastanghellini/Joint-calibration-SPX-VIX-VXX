@@ -41,16 +41,14 @@ Market quotes are not included. To run a model, provide your own spot prices, in
 
 For OU3D_enriched:
 
-1. Copy market_data_template.py to market_data_private.py inside OU3D_enriched.
-2. Fill in the market inputs.
-3. Match the valuation date, option maturities and futures expiries in both the main and validation scripts to your snapshot.
+1. Fill in the market inputs in market_data_template.py
+2. Match the valuation date, option maturities and futures expiries in both the main and validation scripts to your snapshot.
 
 For CIR:
 
-1. Copy market_data_template_CIR.py to market_data_private_CIR.py inside CIR.
-2. Fill in the market inputs, valuation and previous-future expiry dates, option maturities and futures maturities. Times are year fractions on an ACT/365 basis.
+1. Fill in the market inputs in market_data_template_CIR.py.
+2. Match the valuation date, option maturities and futures expiries in both the main and validation scripts to your snapshot. Times are year fractions on an ACT/365 basis.
 
-Keep both private files on your computer. The .gitignore rules exclude these filenames from Git. When uploading through GitHub's website, select only the public package contents; do not upload a working folder containing private inputs.
 
 ## OU3D enriched: calibration and evaluation
 
