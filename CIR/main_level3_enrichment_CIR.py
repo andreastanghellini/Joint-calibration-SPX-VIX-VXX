@@ -2,7 +2,7 @@ import importlib
 from functools import partial
 import numpy as np
 import functions_level3_enrichment_CIR as functions
-from market_data_private_CIR import (
+from market_data_template_CIR import (
     valuation_date, previous_vix_future_expiry, futures_maturities, T_spx, T_vix, T_vxx,
     spx_spot, vix_spot, vxx_spot, r,
     strikes_spx, bid_spx, ask_spx, put_bid_spx, put_ask_spx,
