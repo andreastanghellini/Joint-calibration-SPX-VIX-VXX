@@ -1,5 +1,4 @@
 import math
-from pathlib import Path
 import numpy as np
 from scipy.linalg import expm
 from scipy.sparse import csr_matrix
@@ -9,20 +8,6 @@ try:
     import iisignature
 except ImportError:
     iisignature = None
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    # Return the iterator when progress bars are unavailable.
-    def tqdm(iterable, **kwargs):
-        return iterable
-
-
-PAPER_PRICING_VERSION = "cir_fit_abs_vix_stopped_futures_v1"
-VIX_PROXY = "absolute_linear_signature"
-VIX_FUTURE_PROXY = "stopped_signed_conditional_signature"
-FUTURE_STOPPING_SCHEME = "first_grid_hit_freeze_at_m"
-
 
 # Encode a signature word in level-first lexicographic order.
 def from_word_to_num(word, d_minus_one):
@@ -230,6 +215,16 @@ def reduced_shuffle_product_ell(ell, pair_positions, shuffle_product_coordinates
     pair_weights[pair_positions[:, 0] != pair_positions[:, 1]] *= 2.0
     return pair_weights @ shuffle_product_coordinates
 
+# Differentiate a weighted sum of reduced quadratic variance coordinates.
+def reduced_variance_gradient(ell, pair_positions, shuffle_coordinates, feature_sensitivity):
+    left, right = pair_positions.T
+    pair_sensitivity = shuffle_coordinates @ feature_sensitivity
+    gradient = np.zeros_like(ell)
+    np.add.at(gradient, left, 2.0 * pair_sensitivity * ell[right])
+    off_diagonal = left != right
+    np.add.at(gradient, right[off_diagonal], 2.0 * pair_sensitivity[off_diagonal] * ell[left[off_diagonal]])
+    return gradient
+
 # Map unconstrained parameters into the admissible correlation ellipsoid.
 def rho_b_from_parameters(parameters, rho_ou):
     parameters = np.asarray(parameters, dtype=float)
@@ -378,6 +373,13 @@ def implied_vol_black76(price, forward, strike, maturity, rate, cp=1, low=1e-08,
 # Evaluate raw variance from the reduced signature features.
 def variance_path(ell_shuffle, N, variance_signature_features, window):
     ell_shuffle = np.asarray(ell_shuffle, dtype=float)
+    if isinstance(variance_signature_features, dict):
+        signatures = variance_signature_features['signature_path']
+        if N <= 0 or N > signatures.shape[0]:
+            raise ValueError('N must be between 1 and the number of available time points.')
+        matrix = variance_quadratic_matrix(ell_shuffle, variance_signature_features, signatures.shape[-1], window)
+        selected = signatures[:N]
+        return np.einsum('tpi,tpi->tp', selected @ matrix, selected, optimize=True)
     variance_signature_features = np.asarray(variance_signature_features, dtype=float)
     if variance_signature_features.ndim != 3:
         raise ValueError('variance_signature_features must have shape (n_times, n_paths, signature_dimension).')
@@ -584,7 +586,7 @@ def stopped_vxx_future_paths(ell, signature_path, roll_data, future_floor=1e-8):
 
 
 # Build the discounted, fee-free VXX path from globally stopped futures.
-def vxx_path(initial_vxx, ell, time_steps, truncated_signature_path, roll_data, future_floor=1e-8, return_diagnostics=False):
+def vxx_path(initial_vxx, ell, time_steps, truncated_signature_path, roll_data, future_floor=1e-8, return_diagnostics=False, *, future_paths=None):
     floor_points = future_floor_in_points(future_floor)
     times = np.asarray(time_steps, dtype=float)
     signatures = np.asarray(truncated_signature_path, dtype=float)
@@ -594,7 +596,7 @@ def vxx_path(initial_vxx, ell, time_steps, truncated_signature_path, roll_data, 
     diagnostics = {
         "future_floor_decimal": float(future_floor),
         "future_floor_points": floor_points,
-        "future_stopping_scheme": FUTURE_STOPPING_SCHEME,
+        "future_stopping_scheme": "first_grid_hit_freeze_at_m",
         "evaluated_future_values": 0,
         "stopped_future_values": 0,
         "floored_future_values": 0,
@@ -618,7 +620,8 @@ def vxx_path(initial_vxx, ell, time_steps, truncated_signature_path, roll_data, 
             diagnostics["floored_future_fraction"] = (diagnostics["stopped_future_values"] / diagnostics["evaluated_future_values"])
         return (path, diagnostics) if return_diagnostics else path
 
-    future_paths = stopped_vxx_future_paths(ell, signatures, roll_data, future_floor)
+    if future_paths is None:
+        future_paths = stopped_vxx_future_paths(ell, signatures, roll_data, future_floor)
     if any((np.any(item["raw"][0] <= floor_points) for item in future_paths.values())):
         diagnostics["initial_future_admissible"] = False
         return finish(invalid, False)
@@ -783,9 +786,21 @@ def calibration_block_loss(model_prices, bid_prices, ask_prices, normalization, 
     loss = np.sum(residual)
     return float(loss) if np.isfinite(loss) else 1000000000000.0
 
+# Differentiate the bid-ask loss with respect to option prices and the future.
+def calibration_block_loss_gradient(model_prices, bid_prices, ask_prices, normalization, beta, model_future=None, market_future=None, deltas=None):
+    mid_prices = 0.5 * (bid_prices + ask_prices)
+    outside_band = np.maximum(bid_prices - model_prices, 0.0) + np.maximum(model_prices - ask_prices, 0.0)
+    numerator = (1.0 - beta) * np.abs(model_prices - mid_prices) + beta * outside_band
+    if model_future is not None:
+        numerator += np.abs(deltas * (model_future - market_future))
+    price_slope = (1.0 - beta) * np.sign(model_prices - mid_prices) + beta * ((model_prices > ask_prices).astype(float) - (model_prices < bid_prices).astype(float))
+    residual_slope = 2.0 * numerator / normalization**2
+    future_gradient = 0.0 if model_future is None else float(residual_slope @ np.abs(deltas) * np.sign(model_future - market_future))
+    return residual_slope * price_slope, future_gradient
+
 # Return the sampled minimum raw-variance margin.
 def variance_positivity_constraint(
-    ell, shuffle_tensor_nn, N, variance_signature_features, window, minimum_variance=0.0, variance_pair_positions=None, variance_shuffle_coordinates=None,
+    ell, shuffle_tensor_nn, N, variance_signature_features, window, minimum_variance=0.0, variance_pair_positions=None, variance_shuffle_coordinates=None, return_jacobian=False,
 ):
     ell = np.asarray(ell, dtype=float)
     use_reduced_variance = variance_pair_positions is not None or variance_shuffle_coordinates is not None
@@ -798,13 +813,28 @@ def variance_positivity_constraint(
     if not np.isfinite(minimum_variance) or minimum_variance < 0.0:
         raise ValueError('minimum_variance must be finite and nonnegative.')
     if not np.all(np.isfinite(ell)):
-        return -1000000000000.0
+        return (-1e12, np.zeros_like(ell)) if return_jacobian else -1e12
     with np.errstate(over='ignore', invalid='ignore'):
         ell_shuffle = reduced_shuffle_product_ell(ell, variance_pair_positions, variance_shuffle_coordinates) if use_reduced_variance else shuffle_product_ell(ell, shuffle_tensor_nn)
         raw_variance = variance_path(ell_shuffle, N, variance_signature_features, window)
     if not np.all(np.isfinite(raw_variance)):
-        return -1000000000000.0
-    return float(np.min(raw_variance) - minimum_variance)
+        return (-1e12, np.zeros_like(ell)) if return_jacobian else -1e12
+    active_index = np.unravel_index(np.argmin(raw_variance), raw_variance.shape)
+    margin = float(raw_variance[active_index] - minimum_variance)
+    if not return_jacobian:
+        return margin
+    if isinstance(variance_signature_features, dict):
+        signature = variance_signature_features['signature_path'][active_index]
+        left, right = variance_signature_features['pair_positions'].T
+        active_features = variance_signature_features['pair_to_variance_features'] @ (signature[left] * signature[right])
+    else:
+        active_features = np.asarray(variance_signature_features)[active_index]
+    if use_reduced_variance:
+        gradient = reduced_variance_gradient(ell, variance_pair_positions, variance_shuffle_coordinates, window * active_features)
+    else:
+        matrix = window * (shuffle_tensor_nn @ active_features)
+        gradient = (matrix + matrix.T) @ ell
+    return margin, gradient
 
 # Price the three products and evaluate their joint calibration loss.
 def joint_calibration_objective(
@@ -814,7 +844,7 @@ def joint_calibration_objective(
     beta_spx=0.98, beta_vix=0.98, beta_vxx=0.98, lambda_spx=0.25, lambda_vix=0.5, lambda_vxx=0.25, variance_softness=1e-06, return_components=False,
     cp_spx=None, cp_vix=None, cp_vxx=None, variance_pair_positions=None, variance_shuffle_coordinates=None, variance_treatment='positive_part',
     future_floor=1e-08, vxx_annual_fee=0.0089, leverage_cap=100.0, price_rho_b=None, price_correlation_matrix=None, primary_brownian_increments=None,
-    independent_brownian_normals=None,
+    independent_brownian_normals=None, use_price_control_variates=False, deltas_spx=None, vix_control_loadings=None, collect_gradient_inputs=False,
 ):
     if not np.isfinite(vxx_annual_fee) or vxx_annual_fee < 0.0:
         raise ValueError('vxx_annual_fee must be a finite nonnegative annual decimal rate.')
@@ -852,11 +882,17 @@ def joint_calibration_objective(
         stock_ratio_spx = stock_ratio_path(effective_variance_spx, brownian_increments[:N_spx], dt)
         terminal_spx = forward_spx * stock_ratio_spx[-1]
         model_prices_spx = monte_carlo_option_prices(terminal_spx, strikes_spx, maturity_spx, rate, cp_spx)
-        terminal_vix = vix_option_proxy(vix_path(ell, N_vix, truncated_signature_path)[-1])
+        raw_terminal_vix = vix_path(ell, N_vix, truncated_signature_path)[-1]
+        terminal_vix = vix_option_proxy(raw_terminal_vix)
         model_prices_vix = monte_carlo_option_prices(terminal_vix, strikes_vix, maturity_vix, rate, cp_vix)
         model_future_vix_raw = 100.0 * ell @ vix_future_propagator @ truncated_signature_path[0, 0]
         model_future_vix = float(model_future_vix_raw)
-        discounted_vxx_path = vxx_path(vxx_spot, ell, time_steps_vxx, truncated_signature_path[:time_steps_vxx.size], vxx_roll_data, future_floor=future_floor)
+        if use_price_control_variates:
+            model_prices_spx -= deltas_spx * (np.mean(terminal_spx) - forward_spx)
+            model_prices_vix -= deltas_vix * (np.mean(raw_terminal_vix) - 100.0 * (ell @ vix_control_loadings))
+        signatures_vxx = truncated_signature_path[:time_steps_vxx.size]
+        future_paths = stopped_vxx_future_paths(ell, signatures_vxx, vxx_roll_data, future_floor) if collect_gradient_inputs else None
+        discounted_vxx_path = vxx_path(vxx_spot, ell, time_steps_vxx, signatures_vxx, vxx_roll_data, future_floor=future_floor, future_paths=future_paths)
         terminal_vxx = np.exp((rate - vxx_annual_fee) * maturity_vxx) * discounted_vxx_path[-1]
         model_prices_vxx = monte_carlo_option_prices(terminal_vxx, strikes_vxx, maturity_vxx, rate, cp_vxx)
         loss_spx = calibration_block_loss(model_prices_spx, bid_spx, ask_spx, normalization_spx, beta_spx)
@@ -868,25 +904,39 @@ def joint_calibration_objective(
     joint_loss = float(joint_loss) if np.isfinite(joint_loss) else 1000000000000.0
     calibration_details = {'SPX': float(loss_spx), 'VIX': float(loss_vix), 'VXX': float(loss_vxx), 'model_prices': {'SPX': model_prices_spx, 'VIX': model_prices_vix, 'VXX': model_prices_vxx}, 'model_future_vix': float(model_future_vix), 'model_future_vix_raw': float(model_future_vix_raw), 'leverage_saturated_fraction': float(np.mean(effective_variance_spx > leverage_cap ** 2)), 'stock_ratio_mean': float(np.mean(stock_ratio_spx[-1]))}
     if return_components:
+        if collect_gradient_inputs:
+            calibration_details['gradient_inputs'] = {
+                'raw_variance_spx': variance_spx, 'variance_spx': effective_variance_spx, 'terminal_spx': terminal_spx,
+                'raw_terminal_vix': raw_terminal_vix, 'terminal_vix': terminal_vix, 'terminal_vxx': terminal_vxx,
+                'future_paths': future_paths,
+            }
         return (joint_loss, calibration_details)
     return joint_loss
 
 # Apply the variance constraint to the full parameter vector.
-def variance_positivity_constraint_with_correlations(calibration_parameters, dimension_ell, constraint_inputs):
+def variance_positivity_constraint_with_correlations(calibration_parameters, dimension_ell, constraint_inputs, return_jacobian=False, number_of_time_blocks=1):
     calibration_parameters = np.asarray(calibration_parameters, dtype=float)
     if calibration_parameters.ndim != 1 or calibration_parameters.size < dimension_ell:
         raise ValueError('calibration_parameters has incompatible dimensions.')
-    return variance_positivity_constraint(calibration_parameters[:dimension_ell], **constraint_inputs)
-
-# Convert calibration prices to implied volatilities and plot the three smiles.
-def plot_calibration_smiles(
-    model_prices_spx, model_prices_vix, model_prices_vxx, model_future_vix, strikes_spx, strikes_vix, strikes_vxx, forward_spx, forward_vix, forward_vxx,
-    bid_iv_spx, ask_iv_spx, bid_iv_vix, ask_iv_vix, bid_iv_vxx, ask_iv_vxx, maturity_spx, maturity_vix, maturity_vxx, rate, cp_spx, cp_vix, cp_vxx,
-):
-    model_iv_spx = np.array([implied_vol_black76(price, forward_spx, strike, maturity_spx, rate, cp) for price, strike, cp in zip(model_prices_spx, strikes_spx, cp_spx)])
-    model_iv_vix = np.array([implied_vol_black76(price, forward_vix, strike, maturity_vix, rate, cp) for price, strike, cp in zip(model_prices_vix, strikes_vix, cp_vix)])
-    model_iv_vxx = np.array([implied_vol_black76(price, forward_vxx, strike, maturity_vxx, rate, cp) for price, strike, cp in zip(model_prices_vxx, strikes_vxx, cp_vxx)])
-    return plot_out_of_sample_smiles(model_iv_spx, model_iv_vix, model_iv_vxx, model_future_vix, strikes_spx, strikes_vix, strikes_vxx, forward_spx, forward_vix, forward_vxx, bid_iv_spx, ask_iv_spx, bid_iv_vix, ask_iv_vix, bid_iv_vxx, ask_iv_vxx)
+    ell = calibration_parameters[:dimension_ell]
+    if number_of_time_blocks == 1:
+        result = variance_positivity_constraint(ell, return_jacobian=return_jacobian, **constraint_inputs)
+    else:
+        features = constraint_inputs['variance_signature_features']
+        n_times = constraint_inputs['N']
+        edges = np.linspace(0, n_times, min(number_of_time_blocks, n_times) + 1, dtype=int)
+        results = []
+        for start, stop in zip(edges[:-1], edges[1:]):
+            block_features = {**features, 'signature_path': features['signature_path'][start:stop]} if isinstance(features, dict) else features[start:stop]
+            block_inputs = {**constraint_inputs, 'N': stop - start, 'variance_signature_features': block_features}
+            results.append(variance_positivity_constraint(ell, return_jacobian=return_jacobian, **block_inputs))
+        result = (np.array([value for value, _ in results]), np.stack([gradient for _, gradient in results])) if return_jacobian else np.asarray(results)
+    if not return_jacobian:
+        return result
+    margin, ell_gradient = result
+    gradient = np.zeros(ell_gradient.shape[:-1] + calibration_parameters.shape)
+    gradient[..., :dimension_ell] = ell_gradient
+    return margin, gradient
 
 # Plot the implied-volatility smiles against their market bid-ask bands.
 def plot_out_of_sample_smiles(
@@ -970,6 +1020,90 @@ def cir_sqrt_implicit_step(current_cir, brownian_increment, dt, kappa_cir, theta
     next_root[positive] = (q[positive] + root[positive]) / (2.0 * a)
     next_root[~positive] = 2.0 * c / (root[~positive] - q[~positive])
     return next_root ** 2
+
+# Compute the VIX control mean for the piecewise-linear simulated paths.
+def expected_selected_signature_on_cir_grid(kappa, theta, eta, rho_ou, x0, kappa_cir, theta_cir, eta_cir, y0_cir,
+    time_grid, selected_indices, *, state_grid_size=257, quadrature_order=24):
+    from scipy.interpolate import CubicSpline
+
+    time_grid = np.asarray(time_grid, dtype=float)
+    selected_indices = np.asarray(selected_indices, dtype=int)
+    if time_grid.size == 1:
+        return (selected_indices == 0).astype(float)
+    dt = float(time_grid[1] - time_grid[0])
+    if dt <= 0.0 or not np.allclose(np.diff(time_grid), dt, rtol=1e-10, atol=0.0):
+        raise ValueError('The CIR control mean requires the uniform simulation grid.')
+    kappa, theta, eta, x0 = map(lambda value: np.asarray(value, dtype=float), (kappa, theta, eta, x0))
+    times = time_grid - time_grid[0]
+    mean_ou = theta + (x0 - theta) * np.exp(-times[:, None] * kappa)
+    ou_increments = np.diff(mean_ou, axis=0)
+    decay = np.r_[1.0, np.exp(-kappa * dt)]
+    drift_increment = decay - 1.0
+    kappa_sum = kappa[:, None] + kappa[None, :]
+    innovation = np.zeros((3, 3))
+    innovation[1:, 1:] = rho_ou * np.outer(eta, eta) * -np.expm1(-kappa_sum * dt) / kappa_sum
+    covariance = np.zeros_like(innovation)
+    second_signature = np.zeros_like(innovation)
+    for time, mean, increment in zip(times[:-1], mean_ou[:-1], ou_increments):
+        mean_signature = np.r_[time, mean - x0]
+        mean_increment = np.r_[dt, increment]
+        increment_covariance = covariance * np.outer(drift_increment, drift_increment) + innovation
+        second_signature += np.outer(mean_signature, mean_increment) + covariance * drift_increment[None, :]
+        second_signature += 0.5 * (np.outer(mean_increment, mean_increment) + increment_covariance)
+        covariance = covariance * np.outer(decay, decay) + innovation
+    mean_signature = np.r_[times[-1], mean_ou[-1] - x0]
+    expected = np.empty(selected_indices.size)
+    cir_words = {}
+    for i, index in enumerate(selected_indices):
+        word = tuple(from_num_to_word(int(index), 3))
+        if 3 in word:
+            if sum(letter in (1, 2) for letter in word) > 1:
+                raise ValueError('CIR control words may contain at most one OU letter.')
+            cir_words[i] = word
+        elif not word:
+            expected[i] = 1.0
+        elif len(word) == 1:
+            expected[i] = mean_signature[word[0]]
+        elif len(word) == 2:
+            expected[i] = second_signature[word]
+        elif len(word) == 3 and len(set(word)) == 1:
+            letter = word[0]
+            mean = mean_signature[letter]
+            expected[i] = (mean**3 + 3.0 * mean * covariance[letter, letter]) / 6.0
+        else:
+            raise ValueError(f'Unsupported cubic control word {word}.')
+    if not cir_words:
+        return expected
+
+    # Backward Chen recursion, integrating the same implicit CIR transition as the simulator.
+    # An OU coordinate appearing once in a mixed word can be replaced by its mean path.
+    suffixes = {word[i:] for word in cir_words.values() for i in range(len(word) + 1)}
+    word_positions = {word: i for i, word in enumerate(sorted(suffixes, key=lambda word: (len(word), word)))}
+    upper = max(np.sqrt(y0_cir), np.sqrt(theta_cir)) + 6.0 * eta_cir * np.sqrt(times[-1])
+    root_grid = np.linspace(0.0, upper, state_grid_size)
+    nodes, weights = np.polynomial.hermite.hermgauss(quadrature_order)
+    weights /= np.sqrt(np.pi)
+    current_cir = root_grid[:, None] ** 2
+    next_cir = cir_sqrt_implicit_step(current_cir, np.sqrt(2.0 * dt) * nodes[None, :], dt, kappa_cir, theta_cir, eta_cir)
+    next_cir = np.minimum(np.broadcast_to(next_cir, (state_grid_size, quadrature_order)), upper**2)
+    next_roots = np.sqrt(next_cir)
+    cir_increment = next_cir - current_cir
+    continuation_values = np.zeros((state_grid_size, len(word_positions)))
+    continuation_values[:, word_positions[()]] = 1.0
+    for ou_increment in ou_increments[::-1]:
+        increments = (dt, *ou_increment, cir_increment)
+        continuation = CubicSpline(root_grid, continuation_values)(next_roots)
+        for word, position in word_positions.items():
+            conditional_signature = continuation[:, :, position].copy()
+            prefix_signature = 1.0
+            for length, letter in enumerate(word, start=1):
+                prefix_signature = prefix_signature * increments[letter] / length
+                conditional_signature += prefix_signature * continuation[:, :, word_positions[word[length:]]]
+            continuation_values[:, position] = np.einsum('ij,j->i', conditional_signature, weights)
+    initial_values = CubicSpline(root_grid, continuation_values)(np.sqrt(y0_cir))
+    for i, word in cir_words.items():
+        expected[i] = initial_values[word_positions[word]]
+    return expected
 
 # Construct the predictable SPX Brownian coupling with leverage saturation.
 def brownian_increments_with_saturation(rho_b, rho_primary, variance_left, factor_increments, independent_increments, leverage_cap):
@@ -1092,6 +1226,127 @@ def joint_calibration_objective_with_cir_correlations(
         return (loss, details)
     return result
 
+# Differentiate the normalized loss on the fixed CIR calibration sample.
+def joint_calibration_gradient_with_cir_correlations(calibration_parameters, dimension_ell, rho_primary, driver_increments,
+    independent_normals, objective_inputs, calibration_details, loss_factors):
+    inputs = objective_inputs
+    cached = calibration_details['gradient_inputs']
+    ell = calibration_parameters[:dimension_ell]
+    correlation_parameters = calibration_parameters[dimension_ell:]
+    rho_b = calibration_details['rho_b']
+    weights = np.linalg.solve(rho_primary, rho_b)
+    q_rho = float(np.clip(rho_b @ weights, 0.0, 1.0))
+    signature_path = inputs['truncated_signature_path']
+    n_paths = signature_path.shape[1]
+    use_controls = inputs.get('use_price_control_variates', False)
+    price_gradients = {}
+    for product in ('SPX', 'VIX', 'VXX'):
+        key = product.lower()
+        future_inputs = {'model_future': calibration_details['model_future_vix'], 'market_future': inputs['market_future_vix'],
+            'deltas': inputs['deltas_vix']} if product == 'VIX' else {}
+        price_gradient, future_gradient = calibration_block_loss_gradient(
+            calibration_details['model_prices'][product], inputs['bid_' + key], inputs['ask_' + key],
+            inputs['normalization_' + key], inputs['beta_' + key], **future_inputs)
+        price_gradients[product] = loss_factors[product] * price_gradient
+        if product == 'VIX':
+            vix_future_gradient = loss_factors[product] * future_gradient
+
+    def terminal_loss_sensitivity(terminal, product):
+        key = product.lower()
+        strikes = inputs['strikes_' + key]
+        signs = inputs['cp_' + key]
+        payoff_slopes = signs * (signs * (terminal[:, None] - strikes) > 0.0)
+        discount = np.exp(-inputs['rate'] * inputs['maturity_' + key])
+        return discount * (payoff_slopes @ price_gradients[product]) / n_paths
+
+    # SPX log increments are a*dW_corr + b*dW_ind - v*dt/2 under the capped coupling.
+    dt = inputs['dt']
+    n_spx = inputs['N_spx']
+    factor_drivers = driver_increments[:n_spx]
+    independent_drivers = np.sqrt(dt) * independent_normals[:n_spx]
+    raw_variance = cached['raw_variance_spx']
+    sigma = np.sqrt(cached['variance_spx'])
+    leverage_cap = inputs['leverage_cap']
+    unsaturated = sigma < leverage_cap
+    a = np.minimum(sigma, leverage_cap)
+    chi = np.ones_like(sigma)
+    np.divide(leverage_cap, sigma, out=chi, where=sigma > leverage_cap)
+    b = sigma * np.sqrt(np.maximum(1.0 - q_rho * chi**2, 0.0))
+    correlated_driver = factor_drivers @ weights
+    terminal_spx = cached['terminal_spx']
+    spx_sensitivity = terminal_loss_sensitivity(terminal_spx, 'SPX')
+    if use_controls:
+        spx_sensitivity -= (price_gradients['SPX'] @ inputs['deltas_spx']) / n_paths
+    stock_log_sensitivity = spx_sensitivity * terminal_spx
+
+    da_dv = np.zeros_like(sigma)
+    np.divide(0.5, sigma, out=da_dv, where=(sigma > 0.0) & unsaturated)
+    db_dv = np.zeros_like(b)
+    np.divide(1.0 - q_rho * unsaturated, 2.0 * b, out=db_dv, where=b > 0.0)
+    if inputs.get('variance_treatment', 'positive_part') == 'smooth':
+        shifted = raw_variance - 1e-12
+        variance_slope = 0.5 * (1.0 + shifted / np.hypot(shifted, 2.0 * inputs['variance_softness']))
+    else:
+        variance_slope = raw_variance > 0.0
+    step_sensitivity = (da_dv * correlated_driver + db_dv * independent_drivers - 0.5 * dt) * variance_slope * stock_log_sensitivity
+    features = inputs['variance_signature_features']
+    if isinstance(features, dict):
+        selected = features['signature_path'][:n_spx].reshape(-1, dimension_ell)
+        signature_products = selected.T @ (selected * step_sensitivity.reshape(-1, 1))
+        pair_moments = signature_products[tuple(features['pair_positions'].T)]
+        feature_sensitivity = features['pair_to_variance_features'] @ pair_moments
+    else:
+        feature_sensitivity = np.einsum('tp,tpi->i', step_sensitivity, features[:n_spx], optimize=True)
+    ell_gradient = reduced_variance_gradient(ell, inputs['variance_pair_positions'], inputs['variance_shuffle_coordinates'], inputs['window'] * feature_sensitivity)
+
+    radius = np.sqrt(1.0 + correlation_parameters @ correlation_parameters)
+    correlation_jacobian = np.linalg.cholesky(rho_primary) @ (np.eye(correlation_parameters.size) / radius - np.outer(correlation_parameters, correlation_parameters) / radius**3)
+    weights_jacobian = np.linalg.solve(rho_primary, correlation_jacobian)
+    q_gradient = 2.0 * weights @ correlation_jacobian
+    factor_sensitivity = np.einsum('p,tp,tpi->i', stock_log_sensitivity, a, factor_drivers, optimize=True)
+    independent_coefficient = np.zeros_like(b)
+    np.divide(a**2, 2.0 * b, out=independent_coefficient, where=b > 0.0)
+    independent_sensitivity = np.einsum('p,tp,tp->', stock_log_sensitivity, independent_coefficient, independent_drivers, optimize=True)
+    correlation_gradient = factor_sensitivity @ weights_jacobian - independent_sensitivity * q_gradient
+
+    # VIX options use the absolute proxy, while the control and future use the signed proxy.
+    terminal_signature_vix = signature_path[inputs['N_vix']]
+    vix_sensitivity = terminal_loss_sensitivity(cached['terminal_vix'], 'VIX') * np.sign(cached['raw_terminal_vix'])
+    if use_controls:
+        control_sensitivity = price_gradients['VIX'] @ inputs['deltas_vix']
+        vix_sensitivity -= control_sensitivity / n_paths
+        ell_gradient += 100.0 * control_sensitivity * inputs['vix_control_loadings']
+    ell_gradient += 100.0 * (vix_sensitivity @ terminal_signature_vix)
+    future_loadings = inputs['vix_future_propagator'] @ signature_path[0, 0]
+    ell_gradient += 100.0 * vix_future_gradient * future_loadings
+
+    # Differentiate the VXX log roll factors with frozen futures contributing zero slope.
+    terminal_vxx = cached['terminal_vxx']
+    vxx_log_sensitivity = terminal_loss_sensitivity(terminal_vxx, 'VXX') * terminal_vxx
+    futures = cached['future_paths']
+    for indices, previous, front_expiry, second_expiry, front_propagators, second_propagators, _, _ in inputs['vxx_roll_data']:
+        times = inputs['time_steps_vxx'][indices]
+        front = futures[front_expiry]['stopped'][indices]
+        second = futures[second_expiry]['stopped'][indices]
+        front_weight = (front_expiry - times)[:, None]
+        second_weight = (times - previous)[:, None]
+        basket = front_weight * front + second_weight * second
+        quadrature_weights = np.zeros(times.size)
+        half_steps = 0.5 * np.diff(times)
+        quadrature_weights[:-1] += half_steps
+        quadrature_weights[1:] += half_steps
+        integral_sensitivity = quadrature_weights[:, None] * (front_expiry - previous) / basket**2
+        sensitivities = ((front_expiry, front_propagators, front_weight, integral_sensitivity * second),
+            (second_expiry, second_propagators, second_weight, -integral_sensitivity * front))
+        segment_signature = signature_path[indices]
+        for maturity, propagators, roll_weight, sensitivity in sensitivities:
+            sensitivity[-1] += roll_weight[-1] / basket[-1]
+            sensitivity[0] -= roll_weight[0] / basket[0]
+            sensitivity *= futures[maturity]['alive'][indices] * vxx_log_sensitivity
+            signature_sensitivity = np.einsum('tp,tpj->tj', sensitivity, segment_signature, optimize=True)
+            ell_gradient += 100.0 * np.einsum('tij,tj->i', propagators, signature_sensitivity, optimize=True)
+    return np.r_[ell_gradient, correlation_gradient]
+
 # Close the selected cubic signature coordinates under the generator.
 def generator_closed_cubic_basis(coeff, x0, requested_words, tolerance=1e-12):
     generator = sparse_matrix_L(coeff, x0, 3, 4).toarray()
@@ -1114,19 +1369,18 @@ def generator_closed_cubic_basis(coeff, x0, requested_words, tolerance=1e-12):
     words = [list(map(int, from_num_to_word(int(i), 3))) for i in indices if i >= 21]
     return (indices, generator[np.ix_(indices, indices)], float(error), words)
 
-# Compute selected signatures and disk-backed reduced variance features.
-def compute_cubic_signature_features(paths, selected_indices, reduced_variance_model, cache_directory, show_progress=True):
-    cache_directory = Path(cache_directory)
-    cache_directory.mkdir(parents=True, exist_ok=True)
+# Compute selected signatures and store the compact variance features in memory.
+def compute_cubic_signature_features(paths, selected_indices, reduced_variance_model):
     n_times, npaths, alphabet_size = paths.shape
     if alphabet_size != 4:
         raise ValueError('Expected exactly two OU factors, one CIR and time.')
     level = max((len(from_num_to_word(int(i), 3)) for i in selected_indices))
     k = len(selected_indices)
-    signatures = np.lib.format.open_memmap(cache_directory / 'signature_selected_CIR.npy', mode='w+', dtype=float, shape=(n_times, npaths, k))
-    features = np.lib.format.open_memmap(cache_directory / 'variance_selected_CIR.npy', mode='w+', dtype=float, shape=(n_times, npaths, reduced_variance_model['dimension']))
     pairs = reduced_variance_model['pair_positions']
     transform = reduced_variance_model['pair_to_variance_features']
+    signatures = np.empty((n_times, npaths, k))
+    features = {'signature_path': signatures, 'pair_positions': pairs, 'pair_to_variance_features': transform}
+
     nonempty = selected_indices > 0
     if iisignature is None:
         if level not in (2, 3):
@@ -1134,7 +1388,7 @@ def compute_cubic_signature_features(paths, selected_indices, reduced_variance_m
         full_dimension = from_level_to_num(level, 3) + 1
         state = np.zeros((npaths, full_dimension))
         state[:, 0] = 1.0
-        for step in tqdm(range(n_times), disable=not show_progress):
+        for step in range(n_times):
             if step:
                 dx = paths[step] - paths[step - 1]
                 if level == 3:
@@ -1143,34 +1397,25 @@ def compute_cubic_signature_features(paths, selected_indices, reduced_variance_m
                 second = state[:, 1:5, None] * dx[:, None, :] + 0.5 * dx[:, :, None] * dx[:, None, :]
                 state[:, 5:21] += second.reshape(npaths, 16)
                 state[:, 1:5] += dx
-            selected = state[:, selected_indices]
-            pair_values = selected[:, pairs[:, 0]] * selected[:, pairs[:, 1]]
-            values = pair_values @ transform.T
-            if not np.all(np.isfinite(values)):
-                raise RuntimeError('Non-finite enriched variance features.')
-            signatures[step] = selected
-            features[step] = values
-        signatures.flush()
-        features.flush()
-        return (signatures, features)
-    for p in tqdm(range(npaths), disable=not show_progress):
-        sig = np.zeros((n_times, k))
-        sig[:, 0] = 1
-        sig[1:, nonempty] = iisignature.sig(paths[:, p, :], level, 2)[:, selected_indices[nonempty] - 1]
-        pair_values = sig[:, pairs[:, 0]] * sig[:, pairs[:, 1]]
-        values = pair_values @ transform.T
-        if not np.all(np.isfinite(values)):
-            raise RuntimeError('Non-finite enriched variance features.')
-        signatures[:, p] = sig
-        features[:, p] = values
-    signatures.flush()
-    features.flush()
+            signatures[step] = state[:, selected_indices]
+    else:
+        for p in range(npaths):
+            sig = np.zeros((n_times, k))
+            sig[:, 0] = 1
+            sig[1:, nonempty] = iisignature.sig(paths[:, p, :], level, 2)[:, selected_indices[nonempty] - 1]
+            signatures[:, p] = sig
     return (signatures, features)
 
 # Build the quadratic variance constraints at selected path-time points.
 def sampled_variance_matrices(features, pair_positions, shuffle_coordinates, window, indices, dimension_ell):
-    flat = np.asarray(features).reshape(-1, features.shape[-1])
-    pair_values = window * (flat[np.asarray(indices, dtype=int)] @ shuffle_coordinates.T)
+    indices = np.asarray(indices, dtype=int)
+    if isinstance(features, dict):
+        signatures = features['signature_path'].reshape(-1, dimension_ell)[indices]
+        left, right = features['pair_positions'].T
+        selected_features = (signatures[:, left] * signatures[:, right]) @ features['pair_to_variance_features'].T
+    else:
+        selected_features = np.asarray(features).reshape(-1, features.shape[-1])[indices]
+    pair_values = window * (selected_features @ shuffle_coordinates.T)
     h = np.zeros((len(indices), dimension_ell, dimension_ell))
     left, right = pair_positions.T
     h[:, left, right] = pair_values
@@ -1181,10 +1426,9 @@ def sampled_variance_matrices(features, pair_positions, shuffle_coordinates, win
 def calibrate_cubic_with_active_constraints(
     objective, initial_parameters, dimension_ell, features, signatures, pair_positions, shuffle_coordinates, window, minimum_variance=1e-06, minimum_vix=1e-08,
     maxiter=240, stage_iterations=40, max_stages=8, ftol=3e-05, progress=True, initial_future_loadings=None, minimum_initial_future=0.0,
+    loss_reporter=None,
 ):
     from scipy.optimize import minimize, OptimizeResult
-    from time import perf_counter
-    progress_started = perf_counter()
     k = dimension_ell
     initial_parameters = np.asarray(initial_parameters, dtype=float)
     if initial_parameters.shape != (k + 3,):
@@ -1243,6 +1487,7 @@ def calibrate_cubic_with_active_constraints(
     # Retain the best candidate satisfying the complete sampled constraints.
     def record_candidate(parameters):
         nonlocal best, best_loss
+        previous_best_loss = best_loss
         ok, rv, yv = full_check(parameters)
         loss = float(objective(parameters)) if ok else float('inf')
         if not ok and np.all(np.isfinite(parameters)):
@@ -1258,22 +1503,11 @@ def calibrate_cubic_with_active_constraints(
         if ok and np.isfinite(loss) and (loss < best_loss):
             best = parameters.copy()
             best_loss = loss
+        if loss_reporter is not None and best_loss < previous_best_loss:
+            loss_reporter(best)
         return (ok, rv, yv, loss)
-    progress_header = f"{'Event':<6} {'Iter':>5} {'Total':>6} {'Best loss':>14} {'Min variance':>14} {'Min VIX':>10} {'Trial':>10} {'Time':>9}"
-
-    # Print optimizer progress from the quantities already evaluated.
-    def print_progress_row(event, iteration, total, feasible, raw_variance, raw_vix):
-        elapsed = int(perf_counter() - progress_started)
-        elapsed_text = f'{elapsed // 60:02d}:{elapsed % 60:02d}'
-        status = 'OK' if feasible else 'VIOLATED'
-        print(f'{event:<6} {iteration:5d} {total:6d} {best_loss:14.6e} {np.min(raw_variance):14.5e} {100 * np.min(raw_vix):10.4f} {status:>10} {elapsed_text:>9}', flush=True)
     if progress:
-        print('\n' + '=' * len(progress_header), flush=True)
-        print('CONSTRAINED CALIBRATION', flush=True)
-        print(f'Feasible starting loss: {best_loss:.6e} | warm-start weight: {warm_weight:.4f}', flush=True)
-        print('Best loss: best feasible checkpoint. Minima / Trial: current proposal.', flush=True)
-        print('Min VIX is in index points. Updates every 10 iterations and at each stage end.', flush=True)
-        print('=' * len(progress_header), flush=True)
+        print(f'Starting loss = {best_loss:.8e}', flush=True)
     for stage in range(max_stages):
         if total_iterations >= maxiter:
             break
@@ -1282,11 +1516,6 @@ def calibrate_cubic_with_active_constraints(
         add_worst(vix, active_vix, 24)
         h = sampled_variance_matrices(features, pair_positions, shuffle_coordinates, window, sorted(active_variance), k)
         linear = flat_signatures[sorted(active_vix)].copy()
-        stage_iteration_limit = min(stage_iterations, maxiter - total_iterations)
-        if progress:
-            print(f'\nSTAGE {stage + 1:02d}/{max_stages:02d} | iteration limit: {stage_iteration_limit} | active constraints: variance {len(h)}, VIX {len(linear)}', flush=True)
-            print(progress_header, flush=True)
-            print('-' * len(progress_header), flush=True)
 
         # Evaluate active variance and VIX constraints and all initial futures.
         def inequalities(q):
@@ -1307,9 +1536,9 @@ def calibrate_cubic_with_active_constraints(
         def callback(q):
             count[0] += 1
             if count[0] % 10 == 0:
-                ok, rv, yv, loss = record_candidate(q * scale)
+                record_candidate(q * scale)
                 if progress:
-                    print_progress_row('CHECK', count[0], total_iterations + count[0], ok, rv, yv)
+                    print(f'Iteration {total_iterations + count[0]:4d} | best feasible loss = {best_loss:.8e}', flush=True)
         q0 = current / scale
         result = minimize(lambda q: float(objective(q * scale)), q0, method='SLSQP', bounds=list(zip(q0 - 0.3, q0 + 0.3)), constraints=({'type': 'ineq', 'fun': inequalities, 'jac': inequality_jacobian},), callback=callback, options={'maxiter': min(stage_iterations, maxiter - total_iterations), 'ftol': ftol, 'eps': 1e-06, 'disp': False})
         proposal = result.x * scale
@@ -1317,8 +1546,7 @@ def calibrate_cubic_with_active_constraints(
         total_iterations += int(result.nit)
         history.append({'stage': stage + 1, 'success': bool(result.success), 'message': str(result.message), 'iterations': int(result.nit), 'sample_admissible': ok, 'minimum_variance': float(np.min(variance)), 'minimum_vix_fraction': float(np.min(vix)), 'best_feasible_loss': best_loss, 'active_variance': len(active_variance), 'active_vix': len(active_vix)})
         if progress:
-            print_progress_row('END', int(result.nit), total_iterations, ok, variance, vix)
-            print(f'Stage stop: {result.message}', flush=True)
+            print(f'End of stage {stage + 1} | best feasible loss = {best_loss:.8e}', flush=True)
         if ok and result.success and (np.max(np.abs(result.x - q0)) < 0.299):
             converged = np.allclose(best, proposal, rtol=1e-07, atol=1e-09)
             break
@@ -1328,28 +1556,203 @@ def calibrate_cubic_with_active_constraints(
     ok, variance, vix = full_check(best)
     if not ok:
         raise RuntimeError('Internal error: selected checkpoint is not sampled-admissible.')
-    if progress:
-        print('\n' + '=' * len(progress_header), flush=True)
-        print('CALIBRATION SUMMARY', flush=True)
-        print(f"Status       : {('CONVERGED' if converged else 'STOPPED WITHOUT CONFIRMED CONVERGENCE')}", flush=True)
-        print(f'Iterations   : {total_iterations} / {maxiter} | stages: {len(history)} / {max_stages}', flush=True)
-        print(f'Best loss    : {best_loss:.8e}', flush=True)
-        print(f'Min variance : {np.min(variance):.8e} | min VIX: {100 * np.min(vix):.4f}', flush=True)
-        print('Returned point: feasible on the complete calibration sample.', flush=True)
-        print('=' * len(progress_header), flush=True)
     return OptimizeResult(x=best, fun=best_loss, success=converged, nit=total_iterations, message='Converged with full sampled admissibility check.' if converged else 'Iteration/stage budget reached; returning best fully checked admissible candidate.', stage_history=history, warm_start_weight=warm_weight, minimum_variance=float(np.min(variance)), minimum_vix=float(np.min(vix)), parameter_scale=scale)
-
-# Create an isolated disk cache for one calibration run.
-def create_signature_cache():
-    from tempfile import mkdtemp
-    root = Path(__file__).resolve().with_name('cache_CIR')
-    root.mkdir(parents=True, exist_ok=True)
-    return Path(mkdtemp(prefix='run_', dir=root))
 
 # Normalize the three product losses and return their weighted contributions.
 def normalized_joint_loss(block_losses, *, lambda_spx, lambda_vix, lambda_vxx, loss_scales, objective_scale):
     contributions = {'SPX': objective_scale * lambda_spx * float(block_losses['SPX']) / loss_scales['SPX'], 'VIX': objective_scale * lambda_vix * float(block_losses['VIX']) / loss_scales['VIX'], 'VXX': objective_scale * lambda_vxx * float(block_losses['VXX']) / loss_scales['VXX']}
     return (float(sum(contributions.values())), contributions)
+
+def initial_future_constraint(parameters, *, initial_future_loadings, minimum_initial_future):
+    return initial_future_loadings @ parameters[:initial_future_loadings.shape[1]] - minimum_initial_future
+
+# Keep as much of the candidate as possible along the segment to a feasible anchor.
+def feasible_point_toward_candidate(anchor, candidate, is_feasible):
+    if is_feasible(candidate):
+        return candidate
+    direction = candidate - anchor
+    lower, upper = 0.0, 1.0
+    feasible_parameters = anchor
+    for _ in range(16):
+        weight = 0.5 * (lower + upper)
+        parameters = anchor + weight * direction
+        if is_feasible(parameters):
+            lower = weight
+            feasible_parameters = parameters
+        else:
+            upper = weight
+    return feasible_parameters
+
+# Run the three SLSQP passes with smooth constraints at the critical sample points.
+def calibrate_cir(*, initial_parameters, initial_block_losses, objective_with_components, objective_gradient, normalized_joint_loss,
+    variance_constraint_inputs, constraint_scale, initial_future_loadings, minimum_initial_future, parameter_scales, rho_primary,
+    optimizer_runs, correlation_restart_shrink=0.9):
+    from scipy.optimize import minimize
+
+    if len(optimizer_runs) != 3:
+        raise ValueError('Expected three optimizer passes: descent, correlation restart and refinement.')
+    dimension_ell = initial_future_loadings.shape[1]
+    initial_loss, initial_contributions = normalized_joint_loss(initial_block_losses)
+    objective_scale = max(initial_loss, 1.0)
+    variance_features = variance_constraint_inputs['variance_signature_features']
+    variance_steps = variance_constraint_inputs['N']
+    variance_pairs = variance_constraint_inputs['variance_pair_positions']
+    variance_coordinates = variance_constraint_inputs['variance_shuffle_coordinates']
+    window = variance_constraint_inputs['window']
+    minimum_variance = variance_constraint_inputs['minimum_variance']
+    # Give the solver room for its numerical feasibility tolerance.
+    solver_minimum_variance = minimum_variance + 1e-8
+    future_constraint = lambda parameters: initial_future_constraint(parameters, initial_future_loadings=initial_future_loadings,
+        minimum_initial_future=minimum_initial_future)
+    future_jacobian = np.zeros((initial_future_loadings.shape[0], initial_parameters.size))
+    future_jacobian[:, :dimension_ell] = initial_future_loadings * parameter_scales[:dimension_ell]
+    constraint_ell = None
+    constraint_cache = None
+    active_points = set()
+    rejected_parameters = None
+    rejected_loss = np.inf
+    progress = {'parameters': initial_parameters.copy(), 'loss': initial_loss, 'block_losses': initial_block_losses,
+        'best_parameters': initial_parameters.copy(), 'best_loss': initial_loss, 'evaluations': 0}
+
+    def parameters_from_scaled(scaled_parameters):
+        return initial_parameters + parameter_scales * scaled_parameters
+
+    def sample_variance(parameters):
+        nonlocal constraint_ell, constraint_cache
+        ell = parameters[:dimension_ell]
+        if not np.array_equal(ell, constraint_ell):
+            with np.errstate(over='ignore', invalid='ignore'):
+                product = reduced_shuffle_product_ell(ell, variance_pairs, variance_coordinates)
+                constraint_cache = variance_path(product, variance_steps, variance_features, window)
+            constraint_ell = ell.copy()
+        return constraint_cache
+
+    def sample_feasible(parameters):
+        future_margins = future_constraint(parameters)
+        variance = sample_variance(parameters)
+        return (np.all(np.isfinite(variance)) and np.min(variance) >= minimum_variance
+            and np.all(np.isfinite(future_margins)) and np.all(future_margins >= 0.0))
+
+    if not sample_feasible(initial_parameters):
+        raise ValueError('The initial parameters violate the calibration-sample variance or futures constraints.')
+
+    print(f"Initial loss | joint = {initial_loss:.8e} | SPX = {initial_contributions['SPX']:.8e} | VIX = {initial_contributions['VIX']:.8e} | VXX = {initial_contributions['VXX']:.8e}", flush=True)
+
+    def critical_points(variance):
+        # Screen across trajectories so neighboring times of one path do not fill the working set.
+        paths = np.arange(variance.shape[1])
+        worst_times = np.argmin(variance, axis=0)
+        path_minima = variance[worst_times, paths]
+        count = min(24, paths.size)
+        worst_paths = np.argpartition(path_minima, count - 1)[:count]
+        return set(worst_times[worst_paths] * paths.size + worst_paths)
+
+    def monitored_objective(parameters):
+        nonlocal rejected_parameters, rejected_loss
+        if np.array_equal(parameters, progress['parameters']):
+            return progress['loss']
+        raw_loss, details = objective_with_components(parameters)
+        progress['evaluations'] += 1
+        progress['parameters'] = parameters.copy()
+        progress['block_losses'] = details
+        if not np.isfinite(raw_loss) or raw_loss >= 1e12 or any(not np.isfinite(details[p]) or details[p] >= 1e12 for p in ('SPX', 'VIX', 'VXX')):
+            progress['loss'] = 1e12
+            return progress['loss']
+        loss, contributions = normalized_joint_loss(details)
+        progress['loss'] = loss
+        if loss < progress['best_loss']:
+            if sample_feasible(parameters):
+                progress['best_loss'] = loss
+                progress['best_parameters'] = parameters.copy()
+                print(f"Evaluation {progress['evaluations']:5d} | joint = {loss:.8e} | SPX = {contributions['SPX']:.8e} | VIX = {contributions['VIX']:.8e} | VXX = {contributions['VXX']:.8e}", flush=True)
+            elif loss < rejected_loss:
+                rejected_parameters = parameters.copy()
+                rejected_loss = loss
+        return loss
+
+    def scaled_objective(scaled_parameters):
+        return monitored_objective(parameters_from_scaled(scaled_parameters)) / objective_scale
+
+    def scaled_objective_jacobian(scaled_parameters):
+        parameters = parameters_from_scaled(scaled_parameters)
+        if monitored_objective(parameters) >= 1e12:
+            return np.zeros_like(scaled_parameters)
+        gradient = objective_gradient(parameters, calibration_details=progress['block_losses'])
+        return gradient * parameter_scales / objective_scale
+
+    def solve_stage(starting_parameters, options, trust_radius):
+        active_points.update(critical_points(sample_variance(starting_parameters)))
+        matrices = sampled_variance_matrices(variance_features, variance_pairs, variance_coordinates, window,
+            sorted(active_points), dimension_ell)
+
+        def variance_margins(scaled_parameters):
+            ell = parameters_from_scaled(scaled_parameters)[:dimension_ell]
+            return (np.einsum('i,mij,j->m', ell, matrices, ell) - solver_minimum_variance) / constraint_scale
+
+        def variance_jacobian(scaled_parameters):
+            ell = parameters_from_scaled(scaled_parameters)[:dimension_ell]
+            jacobian = np.zeros((len(matrices), initial_parameters.size))
+            jacobian[:, :dimension_ell] = 2.0 * (matrices @ ell) * parameter_scales[:dimension_ell] / constraint_scale
+            return jacobian
+
+        starting_scaled = (starting_parameters - initial_parameters) / parameter_scales
+        constraints = (
+            {'type': 'ineq', 'fun': variance_margins, 'jac': variance_jacobian},
+            {'type': 'ineq', 'fun': lambda q: future_constraint(parameters_from_scaled(q)), 'jac': lambda q: future_jacobian},
+        )
+        iteration = 0
+
+        def report_iteration(_):
+            nonlocal iteration
+            iteration += 1
+            if iteration == 1 or iteration % 10 == 0:
+                print(f"SLSQP stage iteration {iteration:3d} | last trial loss = {progress['loss']:.8e} | best feasible loss = {progress['best_loss']:.8e}", flush=True)
+
+        result = minimize(scaled_objective, starting_scaled, method='SLSQP', jac=scaled_objective_jacobian,
+            constraints=constraints, bounds=list(zip(starting_scaled - trust_radius, starting_scaled + trust_radius)),
+            callback=report_iteration, options=options)
+        reached_trust_boundary = np.max(np.abs(result.x - starting_scaled)) >= 0.99 * trust_radius
+        return result, reached_trust_boundary
+
+    for run, options in enumerate(optimizer_runs, start=1):
+        starting_parameters = progress['best_parameters'].copy()
+        if run == 2:
+            rho_b = rho_b_from_parameters(starting_parameters[dimension_ell:], rho_primary)
+            starting_parameters[dimension_ell:] = parameters_from_rho_b(correlation_restart_shrink * rho_b, rho_primary)
+        starting_loss = monitored_objective(starting_parameters)
+        print(f"SLSQP run {run}/{len(optimizer_runs)} | starting joint loss = {starting_loss:.8e}", flush=True)
+        iterations_left = options['maxiter']
+        trust_radius = 0.3
+        while iterations_left > 0:
+            previous_best = progress['best_loss']
+            rejected_parameters, rejected_loss = None, np.inf
+            stage_options = {**options, 'maxiter': min(40, iterations_left)}
+            result, reached_trust_boundary = solve_stage(starting_parameters, stage_options, trust_radius)
+            iterations_left -= max(1, result.nit)
+            trial_parameters = parameters_from_scaled(result.x)
+            monitored_objective(trial_parameters)
+
+            new_points = set()
+            if rejected_loss < progress['best_loss']:
+                # Include constraints at a better trial rejected by the full-sample check.
+                variance = sample_variance(rejected_parameters)
+                if np.all(np.isfinite(variance)) and np.min(variance) < minimum_variance:
+                    new_points = critical_points(variance) - active_points
+                    active_points.update(new_points)
+                repaired = feasible_point_toward_candidate(progress['best_parameters'], rejected_parameters, sample_feasible)
+                monitored_objective(repaired)
+
+            improved = progress['best_loss'] < previous_best
+            if not new_points:
+                if result.success and not reached_trust_boundary and sample_feasible(trial_parameters):
+                    break
+                if not improved:
+                    if trust_radius <= 0.0375 or iterations_left <= 0:
+                        break
+                    trust_radius *= 0.5
+            starting_parameters = progress['best_parameters']
+        print(f"End of run {run} | best feasible joint loss = {progress['best_loss']:.8e}", flush=True)
+    return result, progress
 
 # Evaluate the normalized objective with the original invalid-price penalty.
 def normalized_cir_objective(parameters, *, objective_with_components, normalized_joint_loss):
@@ -1358,15 +1761,18 @@ def normalized_cir_objective(parameters, *, objective_with_components, normalize
         return 1000000000000.0
     return normalized_joint_loss(block_losses)[0]
 
+# Build the quadratic variance map from reduced shuffle coefficients.
+def variance_quadratic_matrix(ell_shuffle, features, dimension, window):
+    weights = window * (features['pair_to_variance_features'].T @ ell_shuffle)
+    matrix = np.zeros((dimension, dimension))
+    np.add.at(matrix, tuple(features['pair_positions'].T), weights)
+    return matrix
+
 # Build the fixed quadratic variance map for out-of-sample pricing.
 def fixed_ell_variance_matrix(ell, reduced_model, window):
     ell = np.asarray(ell, dtype=float)
-    pairs = reduced_model['pair_positions']
-    product = reduced_shuffle_product_ell(ell, pairs, reduced_model['shuffle_product_coordinates'])
-    weights = window * (reduced_model['pair_to_variance_features'].T @ product)
-    matrix = np.zeros((ell.size, ell.size))
-    np.add.at(matrix, tuple(pairs.T), weights)
-    return matrix
+    product = reduced_shuffle_product_ell(ell, reduced_model['pair_positions'], reduced_model['shuffle_product_coordinates'])
+    return variance_quadratic_matrix(product, reduced_model, ell.size, window)
 
 # Update level-three signatures and raw variance by Chen concatenation.
 def compute_fixed_cir_signatures_and_variance(paths, selected_indices, variance_matrix):
@@ -1392,3 +1798,4 @@ def compute_fixed_cir_signatures_and_variance(paths, selected_indices, variance_
 # Invert call prices using the original CIR Black-76 convention.
 def invert_prices(prices, forward, strikes, maturity, *, r):
     return np.array([implied_vol_black76(float(price), forward, float(strike), maturity, r, cp=1) if np.isfinite(price) else np.nan for price, strike in zip(prices, strikes)])
+
