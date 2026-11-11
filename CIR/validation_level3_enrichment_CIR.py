@@ -1,7 +1,7 @@
 # Load the pricing routines and the market snapshot.
 import numpy as np
 import functions_level3_enrichment_CIR as functions
-from market_data_private_CIR import (
+from market_data_template_CIR import (
     valuation_date, previous_vix_future_expiry, futures_maturities, T_spx, T_vix, T_vxx, vxx_spot, r,
     strikes_spx, bid_spx, ask_spx, put_bid_spx, put_ask_spx,
     strikes_vix, bid_vix, ask_vix, put_bid_vix, put_ask_vix,
