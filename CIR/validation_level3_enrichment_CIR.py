@@ -5,24 +5,10 @@ from market_data_private_CIR import (
     valuation_date, previous_vix_future_expiry, futures_maturities, T_spx, T_vix, T_vxx, market_future_vix, vxx_spot, r,
     strikes_spx, bid_spx, ask_spx, put_bid_spx, put_ask_spx,
     strikes_vix, bid_vix, ask_vix,
-    strikes_vxx, bid_vxx, ask_vxx,
-)
+    strikes_vxx, bid_vxx, ask_vxx)
 
 # === PASTE THE PARAMETERS FROM THE CURRENT CALIBRATION HERE ===
 # Copy the Optimal ell and Optimal rho_b values printed by the main script.
-'''
-ell_fixed = np.array([
-     1.78034597e-01,  3.42182044e-01,  3.38384706e-02, -3.34090536e-02,
-     1.66124313e-01,  1.44033224e+01,  6.24837337e-02,  4.69427224e-02,
-    -1.25331888e+00, -4.75277297e-01,  2.85416507e-02, -7.57939459e-03,
-     6.89704119e-02, -5.60641533e-03, -1.33887572e-02,  7.55897376e-03,
-    -2.13050781e-02, -3.07672019e-01,  7.50689457e-02, -2.12524796e-02,
-     2.97081249e-01, -2.49253220e-01, -3.11540124e-01, -1.11908573e+00,
-     2.20866228e+00])
-
-rho_b_fixed = np.array([0.16198819, 0.86858957, -0.49394888])
-'''
-
 ell_fixed = np.array([1.80019427e-01,  4.61950053e-01, -1.08385853e-01, -3.02125301e-02,
      1.56072432e-01,  6.17876383e+00,  8.42840799e-01, -7.07860290e-04,
     -8.63394392e-01, -7.82715752e-01,  5.51015859e-02,  1.51765465e-02,
@@ -132,8 +118,7 @@ if use_price_control_variates:
         "SPX": np.array([functions.black_call_delta(forward_spx, strike, T_spx, r, vol)
             for strike, vol in zip(strikes_spx, 0.5 * (call_bid_iv_spx + call_ask_iv_spx))]),
         "VIX": np.array([functions.black_call_delta(forward_vix, strike, T_vix, r, vol)
-            for strike, vol in zip(strikes_vix, 0.5 * (call_bid_iv_vix + call_ask_iv_vix))]),
-    }
+            for strike, vol in zip(strikes_vix, 0.5 * (call_bid_iv_vix + call_ask_iv_vix))])}
 
 
 # === SIMULATION AND OUT-OF-SAMPLE PRICING ===
