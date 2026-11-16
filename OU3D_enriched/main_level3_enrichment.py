@@ -5,7 +5,7 @@ from functools import partial
 from datetime import date
 
 # Fill in market_data_template.py with the market inputs before running.
-from market_data_private import (
+from market_data_template import (
     market_future_vix,
     vxx_spot,
     r,
@@ -19,8 +19,7 @@ from market_data_private import (
     ask_vix,
     strikes_vxx,
     bid_vxx,
-    ask_vxx,
-)
+    ask_vxx)
 
 functions = importlib.reload(functions)
 
@@ -128,7 +127,7 @@ normalization_power = 0.5
 # === FLAG OPTIONS ===
 match_vix_future_exactly = False
 use_analytic_objective_gradient = True
-use_price_control_variates = True
+use_price_control_variates = False
 variance_treatment = "positive_part"
 
 
