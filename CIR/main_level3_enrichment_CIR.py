@@ -2,7 +2,7 @@ import importlib
 from functools import partial
 import numpy as np
 import functions_level3_enrichment_CIR as functions
-from market_data_private_CIR import (
+from market_data_template import (
     valuation_date, previous_vix_future_expiry, futures_maturities, T_spx, T_vix, T_vxx,
     spx_spot, market_future_vix, vxx_spot, r,
     strikes_spx, bid_spx, ask_spx, put_bid_spx, put_ask_spx,
@@ -74,8 +74,7 @@ variance_shuffle_coordinates = reduced_variance_model["shuffle_product_coordinat
 # === SIMULATION AND SIGNATURE FEATURES ===
 paths, time_grid, _, primary_brownian_increments, independent_brownian_normals = functions.simulate_time_extended_ou_cir_with_brownian(
     kappa, theta, eta, rho_ou, rho_b, x0, kappa_cir, theta_cir, eta_cir, y0_cir, Tmax, nsteps, npaths,
-    driver_steps=int(round(T_spx * 365 * daily_observations)), return_brownian_increments=False
-)
+    driver_steps=int(round(T_spx * 365 * daily_observations)), return_brownian_increments=False)
 sigX_truncated, variance_signature_features = functions.compute_cubic_signature_features(paths, selected_signature_indices, reduced_variance_model)
 del paths
 dt = float(time_grid[1] - time_grid[0])
@@ -131,8 +130,7 @@ initial_future_constraint = partial(functions.initial_future_constraint, initial
 variance_constraint_inputs = {
     "shuffle_tensor_nn": None, "N": N_variance_constraint, "variance_signature_features": variance_signature_features,
     "window": window, "minimum_variance": minimum_variance + variance_safety_margin,
-    "variance_pair_positions": variance_pair_positions, "variance_shuffle_coordinates": variance_shuffle_coordinates,
-}
+    "variance_pair_positions": variance_pair_positions, "variance_shuffle_coordinates": variance_shuffle_coordinates}
 variance_constraint = partial(functions.variance_positivity_constraint_with_correlations, dimension_ell=dimension_ell,
     constraint_inputs=variance_constraint_inputs)
 
@@ -146,26 +144,22 @@ objective_model_inputs = {
     "vix_future_propagator": vix_future_propagator, "vxx_roll_data": vxx_roll_data,
     "forward_spx": forward_spx, "vxx_spot": vxx_spot, "leverage_cap": leverage_cap,
     "future_floor": future_floor, "vxx_annual_fee": vxx_annual_fee,
-    "use_price_control_variates": True, "vix_control_loadings": vix_control_loadings, "collect_gradient_inputs": True,
-}
+    "use_price_control_variates": False, "vix_control_loadings": vix_control_loadings, "collect_gradient_inputs": True}
 objective_market_inputs = {
     "strikes_spx": strikes_spx, "strikes_vix": strikes_vix, "strikes_vxx": strikes_vxx,
     "cp_spx": cp_spx, "cp_vix": cp_vix, "cp_vxx": cp_vxx,
     "maturity_spx": T_spx, "maturity_vix": T_vix, "maturity_vxx": T_vxx, "rate": r,
-    "bid_spx": bid_spx, "ask_spx": ask_spx, "bid_vix": bid_vix, "ask_vix": ask_vix, "bid_vxx": bid_vxx, "ask_vxx": ask_vxx,
-}
+    "bid_spx": bid_spx, "ask_spx": ask_spx, "bid_vix": bid_vix, "ask_vix": ask_vix, "bid_vxx": bid_vxx, "ask_vxx": ask_vxx}
 objective_loss_inputs = {
     "normalization_spx": normalization_spx, "normalization_vix": normalization_vix, "normalization_vxx": normalization_vxx,
     "deltas_spx": deltas_spx, "deltas_vix": deltas_vix, "market_future_vix": forward_vix,
     "beta_spx": beta_spx, "beta_vix": beta_vix, "beta_vxx": beta_vxx,
     "lambda_spx": lambda_spx, "lambda_vix": lambda_vix, "lambda_vxx": lambda_vxx,
-    "variance_softness": variance_softness, "variance_treatment": variance_treatment,
-}
+    "variance_softness": variance_softness, "variance_treatment": variance_treatment}
 objective_inputs = {**objective_model_inputs, **objective_market_inputs, **objective_loss_inputs}
 brownian_inputs = {
     "dimension_ell": dimension_ell, "rho_primary": rho_primary, "driver_increments": primary_brownian_increments,
-    "independent_normals": independent_brownian_normals, "objective_inputs": objective_inputs,
-}
+    "independent_normals": independent_brownian_normals, "objective_inputs": objective_inputs}
 objective_with_components = partial(functions.joint_calibration_objective_with_cir_correlations, return_components=True, **brownian_inputs)
 
 
@@ -221,7 +215,7 @@ reference_loss, _ = normalized_joint_loss(initial_block_losses)
 
 
 # === RECOVERED WARM START ===
-# Recovered CIR fit for the February 24 snapshot.
+# Starting point for optimization obtained from a level_2 calibration.
 ell_warm = np.array([
      0.1820341935794468,    0.45757757113627046,  -0.0450364276223573,
     -0.028551866457687626,  0.19271133785129402,   6.4702720554813995,
@@ -231,8 +225,7 @@ ell_warm = np.array([
      0.005227263212118898, -0.026346155468862015, -0.5857533394753457,
     -0.028889823466329432, -0.02332659066528454,   0.2866086094020981,
      0.2439957729169196,    0.18731552206162885,  -0.959527588969014,
-     1.6182306997686515,
-], dtype=float)
+     1.6182306997686515], dtype=float)
 rho_b_warm = np.array([0.25257050232725603, 0.8039805944306185, -0.5868334268691128], dtype=float)
 
 def sample_feasible(parameters):
