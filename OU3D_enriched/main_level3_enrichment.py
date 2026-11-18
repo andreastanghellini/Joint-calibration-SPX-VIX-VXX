@@ -21,6 +21,7 @@ from market_data_template import (
     bid_vxx,
     ask_vxx)
 
+
 functions = importlib.reload(functions)
 
 
