@@ -1,9 +1,3 @@
-"""Synthetic SPX, VIX and VXX inputs for the OU-CIR scripts.
-
-The quotes are the compact OU3D synthetic panel, with the calendar fields
-required by the CIR calibration and validation scripts. Prices are in the
-underlying's price units and the annual interest rate is in decimal form.
-"""
 from datetime import date
 
 import numpy as np
